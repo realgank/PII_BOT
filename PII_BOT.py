@@ -16,6 +16,10 @@ DB_PATH = os.getenv("DB_PATH", "planets.db")
 LOG_DIR = os.getenv("LOG_DIR", "logs")
 LOG_LEVEL_NAME = os.getenv("LOG_LEVEL", "INFO")
 
+# Токен Discord бота хранится исключительно в коде. Укажите его в строке ниже.
+# Значение по умолчанию оставлено пустым, чтобы избежать случайного коммита реального токена.
+HARDCODED_DISCORD_TOKEN = ""
+
 DEFAULT_SLOTS = int(os.getenv("DEFAULT_SLOTS", "10"))
 DEFAULT_DRILLS = int(os.getenv("DEFAULT_DRILLS", "22"))
 DEFAULT_HOURS = int(os.getenv("DEFAULT_HOURS", "168"))  # горизонт для покрытия в расчётах
@@ -1473,15 +1477,16 @@ async def on_ready():
         logger.exception("Failed to sync commands: %s", e)
 
 def main():
-    raw_token = os.environ.get("DISCORD_TOKEN")
+    raw_token = HARDCODED_DISCORD_TOKEN
+    token_source = "HARDCODED_DISCORD_TOKEN"
     if not raw_token:
-        logger.error("Discord token не найден в переменной окружения DISCORD_TOKEN.")
+        logger.error("HARDCODED_DISCORD_TOKEN пуст. Укажите токен напрямую в коде.")
         raise SystemExit(1)
     token = validate_and_clean_token(raw_token)
     if not token:
-        logger.error("Discord token из ENV некорректен. Проверьте значение.")
+        logger.error("Discord token, полученный из %s, некорректен. Проверьте значение.", token_source)
         raise SystemExit(1)
-    logger.info("Использую токен из ENV:DISCORD_TOKEN")
+    logger.info("Использую токен из %s", token_source)
     try:
         bot.run(token)
     except discord.errors.LoginFailure:
