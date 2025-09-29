@@ -117,6 +117,16 @@ DDL = [
         updated_at    TEXT NOT NULL
     );
     """,
+    """
+    CREATE TABLE IF NOT EXISTS pos_defaults (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id   INTEGER NOT NULL,
+        user_id    INTEGER,
+        slots      INTEGER NOT NULL,
+        drills     INTEGER NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+    """,
     "CREATE UNIQUE INDEX IF NOT EXISTS uq_pos_guild_name ON pos(guild_id, name);",
     "CREATE INDEX IF NOT EXISTS ix_pos_owner ON pos(guild_id, owner_user_id);",
     """
@@ -162,6 +172,9 @@ DDL = [
     "CREATE INDEX IF NOT EXISTS ix_pr_constellation ON planet_resources(constellation);",
     "CREATE INDEX IF NOT EXISTS ix_pr_system ON planet_resources(system);",
     "CREATE INDEX IF NOT EXISTS ix_pr_resource ON planet_resources(resource);",
+    "CREATE INDEX IF NOT EXISTS ix_pos_defaults_lookup ON pos_defaults(guild_id, user_id);",
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_pos_defaults_guild_only ON pos_defaults(guild_id) WHERE user_id IS NULL;",
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_pos_defaults_guild_user ON pos_defaults(guild_id, user_id) WHERE user_id IS NOT NULL;",
 ]
 
 def _table_cols(conn: sqlite3.Connection, table: str) -> set:
@@ -295,6 +308,105 @@ def subtract_amounts(a: Dict[str, float], b: Dict[str, float]) -> Dict[str, floa
         if left > 0:
             out[k] = left
     return out
+
+def _pos_defaults_row(conn: sqlite3.Connection, guild_id: int, user_id: Optional[int]) -> Optional[sqlite3.Row]:
+    cur = conn.cursor()
+    if user_id is None:
+        cur.execute(
+            "SELECT id, slots, drills, updated_at FROM pos_defaults WHERE guild_id=? AND user_id IS NULL LIMIT 1",
+            (guild_id,),
+        )
+    else:
+        cur.execute(
+            "SELECT id, slots, drills, updated_at FROM pos_defaults WHERE guild_id=? AND user_id=? LIMIT 1",
+            (guild_id, user_id),
+        )
+    return cur.fetchone()
+
+def set_pos_defaults(conn: sqlite3.Connection, guild_id: int, slots: int, drills: int, user_id: Optional[int] = None):
+    ts = now_utc_iso()
+    row = _pos_defaults_row(conn, guild_id, user_id)
+    cur = conn.cursor()
+    if row:
+        cur.execute(
+            "UPDATE pos_defaults SET slots=?, drills=?, updated_at=? WHERE id=?",
+            (int(slots), int(drills), ts, int(row["id"])),
+        )
+    else:
+        cur.execute(
+            "INSERT INTO pos_defaults(guild_id, user_id, slots, drills, updated_at) VALUES(?,?,?,?,?)",
+            (guild_id, user_id, int(slots), int(drills), ts),
+        )
+    conn.commit()
+
+def clear_user_pos_defaults(conn: sqlite3.Connection, guild_id: int, user_id: int) -> bool:
+    cur = conn.cursor()
+    cur.execute("DELETE FROM pos_defaults WHERE guild_id=? AND user_id=?", (guild_id, user_id))
+    changed = cur.rowcount > 0
+    if changed:
+        conn.commit()
+    return changed
+
+def get_effective_pos_defaults(
+    conn: sqlite3.Connection, guild_id: int, user_id: Optional[int]
+) -> Dict[str, object]:
+    row_user = _pos_defaults_row(conn, guild_id, user_id) if user_id is not None else None
+    if user_id is not None and row_user:
+        return {
+            "slots": int(row_user["slots"]),
+            "drills": int(row_user["drills"]),
+            "source": "user",
+            "updated_at": row_user["updated_at"],
+        }
+
+    row_guild = _pos_defaults_row(conn, guild_id, None)
+    if row_guild:
+        return {
+            "slots": int(row_guild["slots"]),
+            "drills": int(row_guild["drills"]),
+            "source": "guild",
+            "updated_at": row_guild["updated_at"],
+        }
+
+    return {
+        "slots": DEFAULT_SLOTS,
+        "drills": DEFAULT_DRILLS,
+        "source": "env",
+        "updated_at": None,
+    }
+
+def describe_pos_defaults_source(source: str) -> str:
+    if source == "user":
+        return "личные настройки"
+    if source == "guild":
+        return "настройки сервера"
+    return "значения окружения"
+
+def build_pos_defaults_report(
+    conn: sqlite3.Connection, guild_id: int, user_id: Optional[int]
+) -> str:
+    row_user = _pos_defaults_row(conn, guild_id, user_id) if user_id is not None else None
+    row_guild = _pos_defaults_row(conn, guild_id, None)
+
+    def fmt_row(row: Optional[sqlite3.Row]) -> str:
+        if not row:
+            return "не задано"
+        ts = row["updated_at"] or "?"
+        return f"слотов **{int(row['slots'])}**, буров **{int(row['drills'])}** (обновлено {ts})"
+
+    lines = [
+        "**Личные:** " + (fmt_row(row_user) if user_id is not None else "не поддерживается"),
+        "**Сервер:** " + fmt_row(row_guild),
+    ]
+
+    eff = get_effective_pos_defaults(conn, guild_id, user_id)
+    eff_ts = eff.get("updated_at")
+    ts_tail = f" (обновлено {eff_ts})" if eff_ts else ""
+    lines.append(
+        f"**Активно для тебя:** слотов **{eff['slots']}**, буров **{eff['drills']}** — "
+        f"{describe_pos_defaults_source(eff['source'])}{ts_tail}."
+    )
+    return "\n".join(lines)
 
 def set_price(conn: sqlite3.Connection, resource: str, price: float):
     cur = conn.cursor()
@@ -525,6 +637,118 @@ async def resource_autocomplete(interaction: discord.Interaction, current: str) 
     if q and all(ql != x.lower() for x in filtered):
         filtered = [q] + filtered
     return [app_commands.Choice(name=r, value=r) for r in filtered[:25]]
+
+# --- настройки значений по умолчанию для POS ---
+posdefaults_group = app_commands.Group(
+    name="posdefaults",
+    description="Управление значениями по умолчанию для /addpos",
+)
+
+def _validate_default_bounds(value: int, kind: str) -> Optional[str]:
+    if kind == "slots" and not (1 <= value <= 20):
+        return "`slots` должен быть в диапазоне 1..20."
+    if kind == "drills" and not (1 <= value <= 50):
+        return "`drills` должен быть в диапазоне 1..50."
+    return None
+
+@posdefaults_group.command(name="setguild", description="Установить значения по умолчанию для всего сервера.")
+@app_commands.describe(slots="Количество планет-слотов", drills="Количество буров на планету")
+async def posdefaults_setguild(interaction: discord.Interaction, slots: int, drills: int):
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("Только в сервере.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    if not is_admin_user(interaction):
+        await interaction.followup.send("⛔ Команда доступна только администраторам сервера.", ephemeral=True)
+        return
+
+    err = _validate_default_bounds(int(slots), "slots") or _validate_default_bounds(int(drills), "drills")
+    if err:
+        await interaction.followup.send(err, ephemeral=True)
+        return
+
+    conn = ensure_db_ready()
+    try:
+        set_pos_defaults(conn, guild.id, int(slots), int(drills), user_id=None)
+        report = build_pos_defaults_report(conn, guild.id, interaction.user.id)
+        await interaction.followup.send(
+            "✅ Значения по умолчанию для сервера обновлены.\n" + report,
+            ephemeral=True,
+        )
+    except Exception as e:
+        logger.exception("posdefaults_setguild error: %s", e)
+        await interaction.followup.send(f"Ошибка: {e}", ephemeral=True)
+    finally:
+        conn.close()
+
+@posdefaults_group.command(name="set", description="Установить личные значения по умолчанию.")
+@app_commands.describe(slots="Количество планет-слотов", drills="Количество буров на планету")
+async def posdefaults_setuser(interaction: discord.Interaction, slots: int, drills: int):
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("Только в сервере.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+
+    err = _validate_default_bounds(int(slots), "slots") or _validate_default_bounds(int(drills), "drills")
+    if err:
+        await interaction.followup.send(err, ephemeral=True)
+        return
+
+    conn = ensure_db_ready()
+    try:
+        set_pos_defaults(conn, guild.id, int(slots), int(drills), user_id=interaction.user.id)
+        report = build_pos_defaults_report(conn, guild.id, interaction.user.id)
+        await interaction.followup.send(
+            "✅ Личные значения по умолчанию сохранены.\n" + report,
+            ephemeral=True,
+        )
+    except Exception as e:
+        logger.exception("posdefaults_setuser error: %s", e)
+        await interaction.followup.send(f"Ошибка: {e}", ephemeral=True)
+    finally:
+        conn.close()
+
+@posdefaults_group.command(name="clear", description="Очистить личные значения и использовать серверные/ENV.")
+async def posdefaults_clear(interaction: discord.Interaction):
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("Только в сервере.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+
+    conn = ensure_db_ready()
+    try:
+        removed = clear_user_pos_defaults(conn, guild.id, interaction.user.id)
+        report = build_pos_defaults_report(conn, guild.id, interaction.user.id)
+        head = "🧹 Личные значения удалены." if removed else "ℹ️ Личные значения не были заданы."
+        await interaction.followup.send(head + "\n" + report, ephemeral=True)
+    except Exception as e:
+        logger.exception("posdefaults_clear error: %s", e)
+        await interaction.followup.send(f"Ошибка: {e}", ephemeral=True)
+    finally:
+        conn.close()
+
+@posdefaults_group.command(name="show", description="Показать активные значения по умолчанию для /addpos.")
+async def posdefaults_show(interaction: discord.Interaction):
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("Только в сервере.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+
+    conn = ensure_db_ready()
+    try:
+        report = build_pos_defaults_report(conn, guild.id, interaction.user.id)
+        await interaction.followup.send(report, ephemeral=True)
+    except Exception as e:
+        logger.exception("posdefaults_show error: %s", e)
+        await interaction.followup.send(f"Ошибка: {e}", ephemeral=True)
+    finally:
+        conn.close()
+
+tree.add_command(posdefaults_group)
 
 # ==================== КОМАНДЫ ====================
 @tree.command(name="setneed", description="Задать/обновить целевой ОБЪЁМ (единиц) по ресурсу.")
@@ -908,18 +1132,23 @@ async def addpos_cmd(
         await interaction.response.send_message("Только в сервере.", ephemeral=True); return
     await interaction.response.defer(ephemeral=True)
 
-    slots_val  = DEFAULT_SLOTS if (slots is None) else int(slots)
-    drills_val = DEFAULT_DRILLS if (drills is None) else int(drills)
-
-    if slots_val <= 0 or slots_val > 20:
-        await interaction.followup.send("`slots` должен быть в диапазоне 1..20.", ephemeral=True); return
-    if drills_val <= 0 or drills_val > 50:
-        await interaction.followup.send("`drills` должен быть в диапазоне 1..50.", ephemeral=True); return
-
     gid = guild.id
     uid = interaction.user.id
     conn = ensure_db_ready()
     try:
+        defaults = get_effective_pos_defaults(conn, gid, uid)
+        base_slots = int(defaults["slots"])
+        base_drills = int(defaults["drills"])
+        slots_override = slots is not None
+        drills_override = drills is not None
+        slots_val = int(slots) if slots_override else base_slots
+        drills_val = int(drills) if drills_override else base_drills
+
+        err = _validate_default_bounds(slots_val, "slots") or _validate_default_bounds(drills_val, "drills")
+        if err:
+            await interaction.followup.send(err, ephemeral=True)
+            return
+
         constellation = find_constellation_by_system(conn, system)
         if not constellation:
             await interaction.followup.send(f"Система **{system}** не найдена в базе.", ephemeral=True); return
@@ -969,9 +1198,17 @@ async def addpos_cmd(
 
         upsert_assignments(conn, pos_id, assignments)
 
+        def format_source(overridden: bool) -> str:
+            if overridden:
+                return "указано в команде"
+            label = describe_pos_defaults_source(defaults["source"])
+            ts = defaults.get("updated_at")
+            return f"{label} (обновлено {ts})" if ts else label
+
         msg = (
             f"✅ POS **{name}** ({system}, {constellation}) обновлён.\n"
-            f"Слотов: **{slots_val}**, буров/планету: **{drills_val}**.\n"
+            f"Слотов: **{slots_val}** ({format_source(slots_override)}), "
+            f"буров/планету: **{drills_val}** ({format_source(drills_override)}).\n"
             f"Расчёт целей: **цели − склад − текущая добыча**.\n\n"
             + format_discord_response(system, assignments, k_cover)
         )
