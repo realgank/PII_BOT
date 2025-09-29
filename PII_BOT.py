@@ -16,8 +16,7 @@ DB_PATH = os.getenv("DB_PATH", "planets.db")
 LOG_DIR = os.getenv("LOG_DIR", "logs")
 LOG_LEVEL_NAME = os.getenv("LOG_LEVEL", "INFO")
 
-# При необходимости можно "вшить" токен прямо в код. По умолчанию строка пустая —
-# используйте только если нет возможности работать с переменными окружения.
+
 HARDCODED_DISCORD_TOKEN = ""
 
 DEFAULT_SLOTS = int(os.getenv("DEFAULT_SLOTS", "10"))
@@ -1477,15 +1476,6 @@ async def on_ready():
         logger.exception("Failed to sync commands: %s", e)
 
 def main():
-    raw_token = os.environ.get("DISCORD_TOKEN")
-    token_source = "ENV:DISCORD_TOKEN"
-    if not raw_token:
-        if HARDCODED_DISCORD_TOKEN:
-            raw_token = HARDCODED_DISCORD_TOKEN
-            token_source = "HARDCODED_DISCORD_TOKEN"
-        else:
-            logger.error("Discord token не найден в переменной окружения DISCORD_TOKEN и не задан в HARDCODED_DISCORD_TOKEN.")
-            raise SystemExit(1)
     token = validate_and_clean_token(raw_token)
     if not token:
         logger.error("Discord token, полученный из %s, некорректен. Проверьте значение.", token_source)
