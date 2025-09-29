@@ -171,6 +171,16 @@ DDL = [
         UNIQUE(guild_id, resource)
     );
     """,
+    """
+    CREATE TABLE IF NOT EXISTS planet_resources (
+        planet_id     INTEGER,
+        constellation TEXT,
+        system        TEXT,
+        planet_name   TEXT,
+        resource      TEXT,
+        output        REAL
+    );
+    """,
     "CREATE INDEX IF NOT EXISTS ix_have_guild ON guild_have(guild_id);",
     "CREATE INDEX IF NOT EXISTS ix_pr_constellation ON planet_resources(constellation);",
     "CREATE INDEX IF NOT EXISTS ix_pr_system ON planet_resources(system);",
@@ -189,6 +199,37 @@ def ensure_schema(conn: sqlite3.Connection):
     cur = conn.cursor()
     for stmt in DDL:
         cur.execute(stmt)
+
+    # planet_resources: гарантируем наличие таблицы и ключевых колонок
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='planet_resources'")
+    if not cur.fetchone():
+        logger.info("Миграция: создаю таблицу planet_resources")
+        cur.execute(
+            """
+            CREATE TABLE planet_resources (
+                planet_id     INTEGER,
+                constellation TEXT,
+                system        TEXT,
+                planet_name   TEXT,
+                resource      TEXT,
+                output        REAL
+            );
+            """
+        )
+    else:
+        pr_cols = _table_cols(conn, "planet_resources")
+        for col_def in [
+            "planet_id INTEGER",
+            "constellation TEXT",
+            "system TEXT",
+            "planet_name TEXT",
+            "resource TEXT",
+            "output REAL",
+        ]:
+            col_name = col_def.split()[0]
+            if col_name not in pr_cols:
+                logger.info("Миграция: добавляю колонку planet_resources.%s", col_name)
+                cur.execute(f"ALTER TABLE planet_resources ADD COLUMN {col_def}")
 
     # Миграции для старых баз
     def _add_col_if_missing(table: str, col_def: str):
