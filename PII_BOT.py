@@ -555,8 +555,8 @@ def format_discord_response(system: str, assignments: List[Assignment], k_cover:
     if not assignments:
         lines.append("_Ничего не подобрано._")
         return "\n".join(lines)
-    for i, a in enumerate(assignments, 1):
-        tag = "COVER" if i <= k_cover else ""
+    for i, a in enumerate(assignments[:k_cover], 1):
+        tag = "COVER"
         total_rate = a.rate * a.drills
         tail = f" · ≈ {a.isk_per_hour:,.0f} ISK/h".replace(",", " ") if a.isk_per_hour else ""
         prefix = f"[{tag}] " if tag else ""
