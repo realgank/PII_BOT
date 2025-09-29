@@ -472,9 +472,8 @@ def plan_assignments(
     slots: int = DEFAULT_SLOTS,
     drills: int = DEFAULT_DRILLS,
     beta: float = DEFAULT_BETA,
-    k_cover: int = 3,
     prices: Optional[Dict[str, float]] = None
-) -> Tuple[List[Assignment], int]:
+) -> List[Assignment]:
     candidates = build_candidates(conn, constellation)
     need_left = {r: float(v) for r,v in rest_units.items() if v>0}
     next_idx: Dict[str,int] = {r:0 for r in candidates}
@@ -507,20 +506,6 @@ def plan_assignments(
         return rows
 
     assignments: List[Assignment] = []
-    cover_slots = min(k_cover, slots)
-
-    for _ in range(cover_slots):
-        rows = rows_by_worst_eta(include_slot=True)
-        if not rows: break
-        res, _eta, cand, slot_rph = rows[0]
-        pid = int(cand["planet_id"]); base_out=float(cand["output"])
-        mult = (beta ** per_res_taken.get(res,0)) if beta<1.0 else 1.0
-        produced_units = slot_rph * horizon_hours
-        need_left[res] = max(0.0, need_left[res] - produced_units)
-        a = Assignment(pid, res, drills, base_out*mult, cand["system"], cand["planet"], base_out,
-                       (base_out*mult*drills*(prices.get(res,0.0) if prices else 0.0)))
-        assignments.append(a); used_planets.add(pid); per_res_taken[res]=per_res_taken.get(res,0)+1
-        global_rph[res] = global_rph.get(res,0.0) + slot_rph
 
     while len(assignments) < slots:
         rows = rows_by_worst_eta(include_slot=True)
@@ -535,7 +520,7 @@ def plan_assignments(
         assignments.append(a); used_planets.add(pid); per_res_taken[res]=per_res_taken.get(res,0)+1
         global_rph[res] = global_rph.get(res,0.0) + slot_rph
 
-    return assignments, cover_slots
+    return assignments
 
 def upsert_assignments(conn: sqlite3.Connection, pos_id: int, assignments: List[Assignment]):
     cur = conn.cursor()
@@ -550,17 +535,15 @@ def upsert_assignments(conn: sqlite3.Connection, pos_id: int, assignments: List[
         """, (pos_id, a.planet_id, a.resource, a.drills, a.rate, now_utc_iso()))
     conn.commit()
 
-def format_discord_response(system: str, assignments: List[Assignment], k_cover: int) -> str:
-    lines = [f"Назначения для POS в **{system}** (ед/час):", f"COVER={k_cover}", ""]
+def format_discord_response(assignments: List[Assignment]) -> str:
     if not assignments:
-        lines.append("_Ничего не подобрано._")
-        return "\n".join(lines)
-    for i, a in enumerate(assignments[:k_cover], 1):
-        tag = "COVER"
+        return "_Ничего не подобрано._"
+    lines = [f"Всего назначений: **{len(assignments)}**"]
+    for i, a in enumerate(assignments, 1):
         total_rate = a.rate * a.drills
         tail = f" · ≈ {a.isk_per_hour:,.0f} ISK/h".replace(",", " ") if a.isk_per_hour else ""
         lines.append(
-            f"[{tag}] {a.system} · {a.planet_name} · **{a.resource}** · drills={a.drills} · "
+            f"{i}. {a.system} · {a.planet_name} · **{a.resource}** · drills={a.drills} · "
             f"base={a.base_out:.2f}/h/bore → **{total_rate:,.2f}/ч**{tail}".replace(",", " ")
         )
     return "\n".join(lines)
@@ -1185,7 +1168,7 @@ async def addpos_cmd(
         prices_general = get_prices(conn)
         merged_prices = prices_general.copy(); merged_prices.update(prices_have)  # склад перекрывает общие
 
-        assignments, k_cover = plan_assignments(
+        assignments = plan_assignments(
             conn=conn,
             guild_id=gid,
             constellation=constellation,
@@ -1194,7 +1177,6 @@ async def addpos_cmd(
             slots=slots_val,
             drills=drills_val,
             beta=DEFAULT_BETA,
-            k_cover=3,
             prices=merged_prices
         )
 
@@ -1207,12 +1189,15 @@ async def addpos_cmd(
             ts = defaults.get("updated_at")
             return f"{label} (обновлено {ts})" if ts else label
 
+        assignment_text = format_discord_response(assignments)
+
         msg = (
             f"✅ POS **{name}** ({system}, {constellation}) обновлён.\n"
             f"Слотов: **{slots_val}** ({format_source(slots_override)}), "
             f"буров/планету: **{drills_val}** ({format_source(drills_override)}).\n"
             f"Расчёт целей: **цели − склад − текущая добыча**.\n\n"
-            + format_discord_response(system, assignments, k_cover)
+            f"Назначения для POS в **{system}** (ед/час):\n"
+            f"{assignment_text}"
         )
         await interaction.followup.send(msg, ephemeral=True)
 
