@@ -17,7 +17,7 @@ LOG_DIR = os.getenv("LOG_DIR", "logs")
 LOG_LEVEL_NAME = os.getenv("LOG_LEVEL", "INFO")
 
 
-HARDCODED_DISCORD_TOKEN = ""
+DISCORD_TOKEN = ""
 
 DEFAULT_SLOTS = int(os.getenv("DEFAULT_SLOTS", "10"))
 DEFAULT_DRILLS = int(os.getenv("DEFAULT_DRILLS", "22"))
@@ -1476,11 +1476,15 @@ async def on_ready():
         logger.exception("Failed to sync commands: %s", e)
 
 def main():
-    token = validate_and_clean_token(raw_token)
+    token = validate_and_clean_token(DISCORD_TOKEN)
     if not token:
-        logger.error("Discord token, полученный из %s, некорректен. Проверьте значение.", token_source)
+        logger.error(
+            "Discord token не задан или указан некорректно. "
+            "Укажите валидный токен в константе DISCORD_TOKEN в коде.",
+        )
         raise SystemExit(1)
-    logger.info("Использую токен из %s", token_source)
+
+    logger.info("Использую токен, указанный в коде.")
     try:
         bot.run(token)
     except discord.errors.LoginFailure:
