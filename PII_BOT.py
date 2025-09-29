@@ -3,13 +3,14 @@ import os
 import logging
 import sqlite3
 import pathlib
-from typing import Dict, List, Optional, Tuple
+from typing import Awaitable, Callable, Dict, List, Optional, Tuple
 from datetime import datetime, timezone, timedelta
 import re
 import base64
 
 import discord
 from discord import app_commands
+from discord.ui import View, button
 
 # ==================== НАСТРОЙКИ (без config.json) ====================
 DB_PATH = os.getenv("DB_PATH", "planets.db")
@@ -468,6 +469,203 @@ def ensure_owner_or_admin(conn: sqlite3.Connection, interaction: discord.Interac
 intents = discord.Intents.default()
 bot = discord.Client(intents=intents)
 tree = app_commands.CommandTree(bot)
+
+
+class UpdatePlanetsView(View):
+    def __init__(
+        self,
+        rebuild_callback: Callable[..., Awaitable[str]],
+        *,
+        callback_kwargs: Optional[dict] = None,
+        timeout: float = 120.0,
+        allowed_user_id: Optional[int] = None,
+    ):
+        super().__init__(timeout=timeout)
+        self.rebuild_callback = rebuild_callback
+        self.callback_kwargs = callback_kwargs or {}
+        self.allowed_user_id = allowed_user_id
+        self.message: Optional[discord.Message] = None
+        self._update_button: Optional[discord.ui.Button] = None
+        for child in self.children:
+            if isinstance(child, discord.ui.Button):
+                self._update_button = child
+                break
+
+    async def on_timeout(self) -> None:
+        if self._update_button:
+            self._update_button.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except Exception as exc:  # pragma: no cover - defensively log only
+                logger.debug("Не удалось обновить сообщение по таймауту: %s", exc)
+
+    @button(label="Обновить", style=discord.ButtonStyle.primary)
+    async def update_planets(  # type: ignore[override]
+        self,
+        interaction: discord.Interaction,
+        btn: discord.ui.Button,
+    ):
+        if self.allowed_user_id and interaction.user.id != self.allowed_user_id and not is_admin_user(interaction):
+            await interaction.response.send_message(
+                "⛔ Обновлять может только автор команды или админ сервера.",
+                ephemeral=True,
+            )
+            return
+
+        original_label = btn.label
+        btn.disabled = True
+        btn.label = "Обновляю…"
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        if interaction.message:
+            self.message = interaction.message
+            try:
+                await interaction.message.edit(view=self)
+            except Exception as exc:
+                logger.debug("Не удалось обновить сообщение перед пересборкой: %s", exc)
+
+        try:
+            new_content = await self.rebuild_callback(interaction=interaction, **self.callback_kwargs)
+        except PermissionError as exc:
+            btn.disabled = False
+            btn.label = original_label
+            if interaction.message:
+                try:
+                    await interaction.message.edit(view=self)
+                except Exception as edit_exc:
+                    logger.debug("Не удалось вернуть состояние кнопки: %s", edit_exc)
+            await interaction.followup.send(str(exc), ephemeral=True)
+            return
+        except Exception as exc:
+            logger.exception("Ошибка при пересборке списка планет: %s", exc)
+            btn.disabled = False
+            btn.label = original_label
+            if interaction.message:
+                try:
+                    await interaction.message.edit(view=self)
+                except Exception as edit_exc:
+                    logger.debug("Не удалось вернуть состояние кнопки: %s", edit_exc)
+            await interaction.followup.send(f"⚠️ Не удалось обновить: {exc}", ephemeral=True)
+            return
+
+        btn.disabled = False
+        btn.label = original_label
+
+        if interaction.message:
+            self.message = interaction.message
+            try:
+                await interaction.message.edit(content=new_content, view=self)
+            except Exception as exc:
+                logger.exception("Не удалось обновить сообщение после пересборки: %s", exc)
+        await interaction.followup.send("✅ Список планет обновлён.", ephemeral=True)
+
+
+def rebuild_pos_planets_message(
+    conn: sqlite3.Connection,
+    *,
+    guild_id: int,
+    pos_id: int,
+    slots: int,
+    drills: int,
+) -> str:
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT name, system, constellation FROM pos WHERE id=? AND guild_id=?",
+        (pos_id, guild_id),
+    )
+    row = cur.fetchone()
+    if not row:
+        raise ValueError("POS не найден.")
+
+    name = row["name"]
+    system = row["system"]
+    constellation = row["constellation"]
+    if not constellation:
+        constellation = find_constellation_by_system(conn, system)
+        if not constellation:
+            raise ValueError(f"Созвездие для системы {system} не найдено в базе.")
+        cur.execute(
+            "UPDATE pos SET constellation=?, updated_at=? WHERE id=?",
+            (constellation, now_utc_iso(), pos_id),
+        )
+        conn.commit()
+
+    needs_units = load_guild_needs(conn, guild_id)
+    have_units = load_guild_have(conn, guild_id)
+    needs_after_have = subtract_amounts(needs_units, have_units)
+    coverage_units = active_assignments_coverage(conn, guild_id, DEFAULT_HOURS)
+    rest_units = subtract_amounts(needs_after_have, coverage_units)
+
+    prices_have = load_have_prices(conn, guild_id)
+    prices_general = get_prices(conn)
+    merged_prices = prices_general.copy()
+    merged_prices.update(prices_have)
+
+    assignments, k_cover = plan_assignments(
+        conn=conn,
+        guild_id=guild_id,
+        constellation=constellation,
+        rest_units=rest_units,
+        horizon_hours=DEFAULT_HOURS,
+        slots=slots,
+        drills=drills,
+        beta=DEFAULT_BETA,
+        k_cover=3,
+        prices=merged_prices,
+    )
+
+    upsert_assignments(conn, pos_id, assignments)
+
+    cur.execute("UPDATE pos SET updated_at=? WHERE id=?", (now_utc_iso(), pos_id))
+    conn.commit()
+
+    msg = (
+        f"✅ POS **{name}** ({system}, {constellation}) обновлён.\n"
+        f"Слотов: **{slots}**, буров/планету: **{drills}**.\n"
+        f"Расчёт целей: **цели − склад − текущая добыча**.\n\n"
+        + format_discord_response(system, assignments, k_cover)
+    )
+    return msg
+
+
+async def rebuild_pos_planets_interaction(
+    *,
+    interaction: discord.Interaction,
+    guild_id: int,
+    pos_id: int,
+    slots: int,
+    drills: int,
+    initiator_id: Optional[int] = None,
+) -> str:
+    guild = interaction.guild
+    if not guild or guild.id != guild_id:
+        raise ValueError("Команда доступна только в исходном сервере.")
+
+    conn = ensure_db_ready()
+    try:
+        if not ensure_owner_or_admin(conn, interaction, pos_id):
+            raise PermissionError("⛔ Обновлять может только владелец POS или админ сервера.")
+
+        msg = rebuild_pos_planets_message(
+            conn,
+            guild_id=guild_id,
+            pos_id=pos_id,
+            slots=slots,
+            drills=drills,
+        )
+
+        logger.info(
+            "Пересборка планет POS %s (guild=%s) по кнопке. Нажал=%s, инициатор=%s",
+            pos_id,
+            guild_id,
+            interaction.user.id if interaction.user else "?",
+            initiator_id,
+        )
+        return msg
+    finally:
+        conn.close()
+
 
 # --- автодополнение систем ---
 async def system_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
@@ -944,38 +1142,27 @@ async def addpos_cmd(
             pos_id = cur.lastrowid
             conn.commit()
 
-        needs_units = load_guild_needs(conn, gid)
-        have_units  = load_guild_have(conn, gid)
-        needs_after_have = subtract_amounts(needs_units, have_units)
-        coverage_units = active_assignments_coverage(conn, gid, DEFAULT_HOURS)
-        rest_units = subtract_amounts(needs_after_have, coverage_units)
-
-        prices_have = load_have_prices(conn, gid)
-        prices_general = get_prices(conn)
-        merged_prices = prices_general.copy(); merged_prices.update(prices_have)  # склад перекрывает общие
-
-        assignments, k_cover = plan_assignments(
-            conn=conn,
+        msg = rebuild_pos_planets_message(
+            conn,
             guild_id=gid,
-            constellation=constellation,
-            rest_units=rest_units,
-            horizon_hours=DEFAULT_HOURS,
+            pos_id=pos_id,
             slots=slots_val,
             drills=drills_val,
-            beta=DEFAULT_BETA,
-            k_cover=3,
-            prices=merged_prices
         )
 
-        upsert_assignments(conn, pos_id, assignments)
-
-        msg = (
-            f"✅ POS **{name}** ({system}, {constellation}) обновлён.\n"
-            f"Слотов: **{slots_val}**, буров/планету: **{drills_val}**.\n"
-            f"Расчёт целей: **цели − склад − текущая добыча**.\n\n"
-            + format_discord_response(system, assignments, k_cover)
+        view = UpdatePlanetsView(
+            rebuild_callback=rebuild_pos_planets_interaction,
+            callback_kwargs={
+                "guild_id": gid,
+                "pos_id": pos_id,
+                "slots": slots_val,
+                "drills": drills_val,
+                "initiator_id": uid,
+            },
+            allowed_user_id=uid,
         )
-        await interaction.followup.send(msg, ephemeral=True)
+        message = await interaction.followup.send(msg, ephemeral=True, view=view)
+        view.message = message
 
     except Exception as e:
         logger.exception("addpos error: %s", e)
