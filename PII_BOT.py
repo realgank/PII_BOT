@@ -1,0 +1,1260 @@
+﻿# bot_pos.py
+import os
+import logging
+import sqlite3
+import pathlib
+from typing import Dict, List, Optional, Tuple
+from datetime import datetime, timezone, timedelta
+import re
+import base64
+
+import discord
+from discord import app_commands
+
+# ==================== НАСТРОЙКИ (без config.json) ====================
+DB_PATH = os.getenv("DB_PATH", "planets.db")
+LOG_DIR = os.getenv("LOG_DIR", "logs")
+LOG_LEVEL_NAME = os.getenv("LOG_LEVEL", "INFO")
+
+DEFAULT_SLOTS = int(os.getenv("DEFAULT_SLOTS", "10"))
+DEFAULT_DRILLS = int(os.getenv("DEFAULT_DRILLS", "22"))
+DEFAULT_HOURS = int(os.getenv("DEFAULT_HOURS", "168"))  # горизонт для покрытия в расчётах
+DEFAULT_BETA = float(os.getenv("DEFAULT_BETA", "0.85"))
+
+# ==================== ЛОГИ ====================
+LOG_LEVEL = getattr(logging, LOG_LEVEL_NAME.upper(), logging.INFO)
+log_dir = pathlib.Path(LOG_DIR); log_dir.mkdir(exist_ok=True)
+log_filename = log_dir / f"bot_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.log"
+logger = logging.getLogger("pos_bot"); logger.setLevel(LOG_LEVEL)
+for h in list(logger.handlers): logger.removeHandler(h)
+fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s | %(message)s")
+ch = logging.StreamHandler(); ch.setLevel(LOG_LEVEL); ch.setFormatter(fmt)
+fh = logging.FileHandler(log_filename, encoding="utf-8"); fh.setLevel(LOG_LEVEL); fh.setFormatter(fmt)
+logger.addHandler(ch); logger.addHandler(fh)
+logger.info("=== Bot started, log file: %s ===", log_filename)
+
+# ==================== ХЕЛПЕРЫ ====================
+def now_utc_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+def clean_resource_name(resource: str) -> str:
+    return (resource or "").strip().strip('"').strip("'").strip()
+
+def is_admin_user(interaction: discord.Interaction) -> bool:
+    perms = getattr(interaction.user, "guild_permissions", None)
+    return bool(perms and (perms.administrator or perms.manage_guild))
+
+# --- безопасная отправка длинных сообщений ---
+MAX_DISCORD_MSG = 2000
+SAFE_LEN = 1900
+
+async def send_long(interaction: discord.Interaction, text: str, ephemeral: bool = False, title: str = "Message"):
+    import io
+    if len(text) <= SAFE_LEN:
+        await interaction.followup.send(text, ephemeral=ephemeral)
+        return
+    lines = text.split("\n")
+    chunks, cur, cur_len = [], [], 0
+    for ln in lines:
+        add = len(ln) + 1
+        if cur_len + add > SAFE_LEN and cur:
+            chunks.append("\n".join(cur))
+            cur, cur_len = [ln], len(ln) + 1
+        else:
+            cur.append(ln); cur_len += add
+    if cur: chunks.append("\n".join(cur))
+    if len(chunks) > 5:
+        buf = io.BytesIO(text.encode("utf-8")); buf.seek(0)
+        await interaction.followup.send(
+            content=f"📄 {title}: список слишком большой, приложил файлом.",
+            file=discord.File(buf, filename=f"{title.lower()}.txt"),
+            ephemeral=ephemeral,
+        )
+        return
+    total = len(chunks)
+    for i, ch in enumerate(chunks, 1):
+        header = f"{title} (часть {i}/{total})\n" if total > 1 else ""
+        await interaction.followup.send(header + ch, ephemeral=ephemeral)
+
+# --- проверка токена Discord ---
+def validate_and_clean_token(raw: Optional[str]) -> Optional[str]:
+    if not raw:
+        return None
+    token = "".join(raw.split())
+    token = "".join(ch for ch in token if ch.isprintable())
+    parts = token.split(".")
+    if len(parts) != 3 or any(len(p) == 0 for p in parts):
+        logger.error("Токен выглядит некорректно: ожидалось 3 части через точку.")
+        return None
+    pattern = re.compile(r"^[A-Za-z0-9_\-]{20,}\.[A-Za-z0-9_\-]{5,}\.[A-Za-z0-9_\-]{20,}$")
+    if not pattern.match(token):
+        logger.error("Токен не проходит базовую проверку формата.")
+        return None
+    try:
+        pad = '=' * (-len(parts[0]) % 4)
+        base64.urlsafe_b64decode(parts[0] + pad)
+    except Exception:
+        logger.warning("Первая часть токена не декодируется как base64url — возможно, токен валиден, продолжаем.")
+    return token
+
+# ==================== БД ====================
+def connect_db(db_path: str) -> sqlite3.Connection:
+    conn = sqlite3.connect(db_path, detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+DDL = [
+    """
+    CREATE TABLE IF NOT EXISTS pos (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id      INTEGER NOT NULL,
+        owner_user_id INTEGER NOT NULL,
+        name          TEXT NOT NULL,
+        system        TEXT NOT NULL,
+        constellation TEXT NOT NULL,
+        created_at    TEXT NOT NULL,
+        updated_at    TEXT NOT NULL
+    );
+    """,
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_pos_guild_name ON pos(guild_id, name);",
+    "CREATE INDEX IF NOT EXISTS ix_pos_owner ON pos(guild_id, owner_user_id);",
+    """
+    CREATE TABLE IF NOT EXISTS pos_planet (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        pos_id         INTEGER NOT NULL,
+        planet_id      INTEGER NOT NULL,
+        resource       TEXT NOT NULL,
+        drills_count   INTEGER NOT NULL,
+        rate           REAL NOT NULL,
+        created_at     TEXT NOT NULL,
+        UNIQUE(pos_id, planet_id),
+        FOREIGN KEY (pos_id) REFERENCES pos(id) ON DELETE CASCADE
+    );
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS guild_needs_row (
+        guild_id        INTEGER NOT NULL,
+        resource        TEXT NOT NULL,
+        amount_required REAL NOT NULL,
+        updated_at      TEXT NOT NULL,
+        UNIQUE(guild_id, resource)
+    );
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS isk_price (
+        resource  TEXT PRIMARY KEY,
+        price     REAL NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS guild_have (
+        guild_id     INTEGER NOT NULL,
+        resource     TEXT NOT NULL,
+        amount_units REAL NOT NULL,
+        unit_price   REAL,
+        updated_at   TEXT NOT NULL,
+        UNIQUE(guild_id, resource)
+    );
+    """,
+    "CREATE INDEX IF NOT EXISTS ix_have_guild ON guild_have(guild_id);",
+    "CREATE INDEX IF NOT EXISTS ix_pr_constellation ON planet_resources(constellation);",
+    "CREATE INDEX IF NOT EXISTS ix_pr_system ON planet_resources(system);",
+    "CREATE INDEX IF NOT EXISTS ix_pr_resource ON planet_resources(resource);",
+]
+
+def _table_cols(conn: sqlite3.Connection, table: str) -> set:
+    cur = conn.cursor()
+    cur.execute(f"PRAGMA table_info({table})")
+    return {row[1] for row in cur.fetchall()}
+
+def ensure_schema(conn: sqlite3.Connection):
+    cur = conn.cursor()
+    for stmt in DDL:
+        cur.execute(stmt)
+
+    # Миграции для старых баз
+    def _add_col_if_missing(table: str, col_def: str):
+        col = col_def.split()[0]
+        if col not in _table_cols(conn, table):
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {col_def}")
+
+    def _backfill_timestamp(table: str, col: str, value: Optional[str] = None):
+        if col in _table_cols(conn, table):
+            v = value or now_utc_iso()
+            conn.execute(f"UPDATE {table} SET {col}=? WHERE {col} IS NULL OR {col}=''", (v,))
+
+    # pos: гарантируем created_at/updated_at
+    _add_col_if_missing("pos", "created_at TEXT")
+    _add_col_if_missing("pos", "updated_at TEXT")
+    _backfill_timestamp("pos", "created_at")
+    _backfill_timestamp("pos", "updated_at")
+
+    # pos_planet: если был end_time_utc — пересоберём таблицу без него
+    cols = _table_cols(conn, "pos_planet")
+    if "end_time_utc" in cols:
+        logger.info("Миграция: удаляю pos_planet.end_time_utc (пересоздание таблицы)")
+        cur.execute("PRAGMA foreign_keys=OFF")
+        try:
+            cur.execute("DROP INDEX IF EXISTS ix_pp_end")
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS pos_planet_new (
+                    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                    pos_id         INTEGER NOT NULL,
+                    planet_id      INTEGER NOT NULL,
+                    resource       TEXT NOT NULL,
+                    drills_count   INTEGER NOT NULL,
+                    rate           REAL NOT NULL,
+                    created_at     TEXT NOT NULL,
+                    UNIQUE(pos_id, planet_id),
+                    FOREIGN KEY (pos_id) REFERENCES pos(id) ON DELETE CASCADE
+                );
+            """)
+            cur.execute("""
+                INSERT INTO pos_planet_new (id, pos_id, planet_id, resource, drills_count, rate, created_at)
+                SELECT id, pos_id, planet_id, resource, drills_count, rate, COALESCE(created_at, ?)
+                FROM pos_planet
+            """, (now_utc_iso(),))
+            cur.execute("DROP TABLE pos_planet")
+            cur.execute("ALTER TABLE pos_planet_new RENAME TO pos_planet")
+        finally:
+            cur.execute("PRAGMA foreign_keys=ON")
+
+    # guild_have/isk_price/guild_needs_row: гарантируем updated_at
+    _add_col_if_missing("guild_have", "unit_price REAL")
+    _add_col_if_missing("guild_have", "updated_at TEXT"); _backfill_timestamp("guild_have", "updated_at")
+    _add_col_if_missing("isk_price", "updated_at TEXT");  _backfill_timestamp("isk_price", "updated_at")
+    _add_col_if_missing("guild_needs_row", "updated_at TEXT"); _backfill_timestamp("guild_needs_row", "updated_at")
+
+    conn.commit()
+
+def ensure_db_ready() -> sqlite3.Connection:
+    conn = connect_db(DB_PATH)
+    ensure_schema(conn)
+    return conn
+
+# ==================== ДАННЫЕ / УТИЛИТЫ ====================
+def find_constellation_by_system(conn: sqlite3.Connection, system: str) -> Optional[str]:
+    cur = conn.cursor()
+    cur.execute("""SELECT constellation FROM planet_resources WHERE system=? GROUP BY constellation""", (system,))
+    row = cur.fetchone()
+    return row["constellation"] if row else None
+
+def get_distinct_systems(conn: sqlite3.Connection) -> List[str]:
+    cur = conn.cursor()
+    cur.execute("""SELECT system FROM planet_resources GROUP BY system ORDER BY system""")
+    return [r["system"] for r in cur.fetchall()]
+
+def load_guild_have(conn: sqlite3.Connection, guild_id: int) -> Dict[str, float]:
+    cur = conn.cursor()
+    cur.execute("""SELECT resource, amount_units FROM guild_have WHERE guild_id=?""", (guild_id,))
+    return {row["resource"]: float(row["amount_units"]) for row in cur.fetchall()}
+
+def load_have_prices(conn: sqlite3.Connection, guild_id: int) -> Dict[str, float]:
+    cur = conn.cursor()
+    cur.execute("""SELECT resource, unit_price FROM guild_have WHERE guild_id=? AND unit_price IS NOT NULL""", (guild_id,))
+    return {row["resource"]: float(row["unit_price"]) for row in cur.fetchall()}
+
+def load_guild_needs(conn: sqlite3.Connection, guild_id: int) -> Dict[str, float]:
+    cur = conn.cursor()
+    cur.execute("""SELECT resource, amount_required FROM guild_needs_row WHERE guild_id=?""", (guild_id,))
+    return {row["resource"]: float(row["amount_required"]) for row in cur.fetchall()}
+
+def active_production_rates(conn: sqlite3.Connection, guild_id: int) -> Dict[str, float]:
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT pp.resource, SUM(pp.rate * pp.drills_count) AS rph
+        FROM pos_planet pp
+        JOIN pos p ON p.id = pp.pos_id
+        WHERE p.guild_id=?
+        GROUP BY pp.resource
+    """, (guild_id,))
+    return {row["resource"]: float(row["rph"] or 0.0) for row in cur.fetchall()}
+
+def active_assignments_coverage(conn: sqlite3.Connection, guild_id: int, horizon_hours: int) -> Dict[str, float]:
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT pp.resource, pp.rate, pp.drills_count
+        FROM pos_planet pp
+        JOIN pos p ON p.id = pp.pos_id
+        WHERE p.guild_id=?
+    """, (guild_id,))
+    cov: Dict[str, float] = {}
+    eff_h = float(horizon_hours)
+    for r in cur.fetchall():
+        produced = float(r["rate"]) * int(r["drills_count"]) * eff_h
+        res = r["resource"]
+        cov[res] = cov.get(res, 0.0) + produced
+    return cov
+
+def subtract_amounts(a: Dict[str, float], b: Dict[str, float]) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    for k, av in a.items():
+        left = max(0.0, float(av) - float(b.get(k, 0.0)))
+        if left > 0:
+            out[k] = left
+    return out
+
+def set_price(conn: sqlite3.Connection, resource: str, price: float):
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO isk_price(resource, price, updated_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(resource) DO UPDATE SET price=excluded.price, updated_at=excluded.updated_at
+    """, (clean_resource_name(resource), float(price), now_utc_iso()))
+    conn.commit()
+
+def get_prices(conn: sqlite3.Connection) -> Dict[str, float]:
+    cur = conn.cursor()
+    cur.execute("SELECT resource, price FROM isk_price")
+    return {row["resource"]: float(row["price"]) for row in cur.fetchall()}
+
+def get_price(conn: sqlite3.Connection, resource: str) -> Optional[float]:
+    cur = conn.cursor()
+    cur.execute("SELECT price FROM isk_price WHERE resource=?", (clean_resource_name(resource),))
+    row = cur.fetchone()
+    return float(row["price"]) if row else None
+
+# --- кандидаты планет по созвездию ---
+def build_candidates(conn: sqlite3.Connection, constellation: str) -> Dict[str, List[dict]]:
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT 
+            CASE WHEN typeof(planet_id)='integer' AND planet_id>0 THEN planet_id ELSE rowid END AS planet_id,
+            system, planet_name, resource, output
+        FROM planet_resources
+        WHERE constellation=? AND output>0
+        ORDER BY resource, output DESC
+    """, (constellation,))
+    rows = cur.fetchall()
+    out: Dict[str, List[dict]] = {}
+    for r in rows:
+        res = r["resource"]
+        out.setdefault(res, []).append({
+            "planet_id": int(r["planet_id"]),
+            "system": r["system"],
+            "planet": r["planet_name"],
+            "output": float(r["output"]),
+        })
+    return out
+
+# ==================== ПЛАНИРОВЩИК ====================
+class Assignment:
+    __slots__ = ("planet_id","resource","drills","rate","system","planet_name","base_out","isk_per_hour")
+    def __init__(self, planet_id:int, resource:str, drills:int, rate:float,
+                 system:str, planet_name:str, base_out:float, isk_per_hour:float=0.0):
+        self.planet_id=planet_id; self.resource=resource; self.drills=drills
+        self.rate=rate; self.system=system; self.planet_name=planet_name
+        self.base_out=base_out; self.isk_per_hour=isk_per_hour
+
+def plan_assignments(
+    conn: sqlite3.Connection,
+    guild_id: int,
+    constellation: str,
+    rest_units: Dict[str, float],
+    horizon_hours: int,
+    slots: int = DEFAULT_SLOTS,
+    drills: int = DEFAULT_DRILLS,
+    beta: float = DEFAULT_BETA,
+    k_cover: int = 3,
+    prices: Optional[Dict[str, float]] = None
+) -> Tuple[List[Assignment], int]:
+    candidates = build_candidates(conn, constellation)
+    need_left = {r: float(v) for r,v in rest_units.items() if v>0}
+    next_idx: Dict[str,int] = {r:0 for r in candidates}
+    used_planets: set[int] = set()
+    per_res_taken: Dict[str,int] = {}
+    global_rph = active_production_rates(conn, guild_id)
+
+    def advance(res:str)->Optional[dict]:
+        lst = candidates.get(res) or []
+        i = next_idx.get(res,0)
+        while i < len(lst) and int(lst[i]["planet_id"]) in used_planets:
+            i += 1
+        next_idx[res]=i
+        return lst[i] if i < len(lst) else None
+
+    def rows_by_worst_eta(include_slot: bool) -> List[Tuple[str,float,dict,float]]:
+        rows=[]
+        for res, left_units in need_left.items():
+            if left_units <= 0: continue
+            cand = advance(res)
+            if not cand: continue
+            base_out = max(float(cand["output"]), 1e-9)
+            mult = (beta ** per_res_taken.get(res,0)) if beta<1.0 else 1.0
+            slot_rph = base_out * drills * mult
+            base_global = float(global_rph.get(res, 0.0))
+            denom = base_global + (slot_rph if include_slot else 0.0)
+            eta_h = (left_units / denom) if denom>0 else float("inf")
+            rows.append((res, eta_h, cand, slot_rph))
+        rows.sort(key=lambda t: t[1], reverse=True)
+        return rows
+
+    assignments: List[Assignment] = []
+    cover_slots = min(k_cover, slots)
+
+    for _ in range(cover_slots):
+        rows = rows_by_worst_eta(include_slot=True)
+        if not rows: break
+        res, _eta, cand, slot_rph = rows[0]
+        pid = int(cand["planet_id"]); base_out=float(cand["output"])
+        mult = (beta ** per_res_taken.get(res,0)) if beta<1.0 else 1.0
+        produced_units = slot_rph * horizon_hours
+        need_left[res] = max(0.0, need_left[res] - produced_units)
+        a = Assignment(pid, res, drills, base_out*mult, cand["system"], cand["planet"], base_out,
+                       (base_out*mult*drills*(prices.get(res,0.0) if prices else 0.0)))
+        assignments.append(a); used_planets.add(pid); per_res_taken[res]=per_res_taken.get(res,0)+1
+        global_rph[res] = global_rph.get(res,0.0) + slot_rph
+
+    while len(assignments) < slots:
+        rows = rows_by_worst_eta(include_slot=True)
+        if not rows: break
+        res, _eta, cand, slot_rph = rows[0]
+        pid = int(cand["planet_id"]); base_out=float(cand["output"])
+        mult = (beta ** per_res_taken.get(res,0)) if beta<1.0 else 1.0
+        produced_units = slot_rph * horizon_hours
+        need_left[res] = max(0.0, need_left[res] - produced_units)
+        a = Assignment(pid, res, drills, base_out*mult, cand["system"], cand["planet"], base_out,
+                       (base_out*mult*drills*(prices.get(res,0.0) if prices else 0.0)))
+        assignments.append(a); used_planets.add(pid); per_res_taken[res]=per_res_taken.get(res,0)+1
+        global_rph[res] = global_rph.get(res,0.0) + slot_rph
+
+    return assignments, cover_slots
+
+def upsert_assignments(conn: sqlite3.Connection, pos_id: int, assignments: List[Assignment]):
+    cur = conn.cursor()
+    for a in assignments:
+        cur.execute("""
+            INSERT INTO pos_planet (pos_id, planet_id, resource, drills_count, rate, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(pos_id, planet_id) DO UPDATE
+              SET resource=excluded.resource,
+                  drills_count=excluded.drills_count,
+                  rate=excluded.rate
+        """, (pos_id, a.planet_id, a.resource, a.drills, a.rate, now_utc_iso()))
+    conn.commit()
+
+def format_discord_response(system: str, assignments: List[Assignment], k_cover: int) -> str:
+    k_farm = max(0, len(assignments) - k_cover)
+    lines = [f"Назначения для POS в **{system}** (ед/час):", f"COVER={k_cover}, FARM={k_farm}", ""]
+    if not assignments:
+        lines.append("_Ничего не подобрано._")
+        return "\n".join(lines)
+    for i, a in enumerate(assignments, 1):
+        tag = "COVER" if i <= k_cover else "FARM"
+        total_rate = a.rate * a.drills
+        tail = f" · ≈ {a.isk_per_hour:,.0f} ISK/h".replace(",", " ") if a.isk_per_hour else ""
+        lines.append(
+            f"[{tag}] {a.system} · {a.planet_name} · **{a.resource}** · drills={a.drills} · "
+            f"base={a.base_out:.2f}/h/bore → **{total_rate:,.2f}/ч**{tail}".replace(",", " ")
+        )
+    return "\n".join(lines)
+
+# ==================== ПРАВА ====================
+def get_pos_owner(conn: sqlite3.Connection, pos_id: int) -> Optional[int]:
+    cur = conn.cursor()
+    cur.execute("SELECT owner_user_id FROM pos WHERE id=?", (pos_id,))
+    row = cur.fetchone()
+    return int(row["owner_user_id"]) if row else None
+
+def ensure_owner_or_admin(conn: sqlite3.Connection, interaction: discord.Interaction, pos_id: int) -> bool:
+    if is_admin_user(interaction):
+        return True
+    owner_id = get_pos_owner(conn, pos_id)
+    return owner_id is not None and owner_id == interaction.user.id
+
+# ==================== DISCORD ====================
+intents = discord.Intents.default()
+bot = discord.Client(intents=intents)
+tree = app_commands.CommandTree(bot)
+
+# --- автодополнение систем ---
+async def system_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+    conn = ensure_db_ready()
+    try:
+        items = get_distinct_systems(conn)
+    finally:
+        conn.close()
+    q = (current or "").lower()
+    if q:
+        items = [s for s in items if q in s.lower()]
+    return [app_commands.Choice(name=s, value=s) for s in items[:25]]
+
+# --- автодополнение ресурсов (объединённое) ---
+def resource_autocomplete_choices(conn: sqlite3.Connection, guild_id: Optional[int] = None) -> List[str]:
+    cur = conn.cursor()
+    seen, out = set(), []
+
+    def add(name: Optional[str]):
+        if not name: return
+        n = clean_resource_name(name)
+        if not n: return
+        k = n.lower()
+        if k not in seen:
+            seen.add(k); out.append(n)
+
+    # 1) глобальные из planet_resources
+    cur.execute("""SELECT resource FROM planet_resources GROUP BY resource""")
+    for r in cur.fetchall(): add(r["resource"])
+    # 2) цели этого сервера
+    if guild_id is not None:
+        cur.execute("""SELECT resource FROM guild_needs_row WHERE guild_id=? GROUP BY resource""", (guild_id,))
+        for r in cur.fetchall(): add(r["resource"])
+    # 3) склад этого сервера
+    if guild_id is not None:
+        cur.execute("""SELECT resource FROM guild_have WHERE guild_id=? GROUP BY resource""", (guild_id,))
+        for r in cur.fetchall(): add(r["resource"])
+    # 4) заданные цены
+    cur.execute("""SELECT resource FROM isk_price GROUP BY resource""")
+    for r in cur.fetchall(): add(r["resource"])
+
+    out.sort()
+    return out[:2000]
+
+async def resource_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+    conn = ensure_db_ready()
+    try:
+        gid = interaction.guild.id if interaction.guild else None
+        items = resource_autocomplete_choices(conn, guild_id=gid)
+    finally:
+        conn.close()
+    q = clean_resource_name(current or "")
+    ql = q.lower()
+    filtered = [x for x in items if ql in x.lower()] if q else items
+    if q and all(ql != x.lower() for x in filtered):
+        filtered = [q] + filtered
+    return [app_commands.Choice(name=r, value=r) for r in filtered[:25]]
+
+# ==================== КОМАНДЫ ====================
+@tree.command(name="setneed", description="Задать/обновить целевой ОБЪЁМ (единиц) по ресурсу.")
+@app_commands.describe(resource="Ресурс", amount="Целевой объём (units)")
+@app_commands.autocomplete(resource=resource_autocomplete)
+async def setneed_cmd(interaction: discord.Interaction, resource: str, amount: float):
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("Только в сервере.", ephemeral=True); return
+    res = clean_resource_name(resource)
+    if amount < 0:
+        await interaction.response.send_message("amount должен быть >= 0.", ephemeral=True); return
+    conn = ensure_db_ready()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO guild_needs_row (guild_id, resource, amount_required, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(guild_id, resource) DO UPDATE
+              SET amount_required=excluded.amount_required, updated_at=excluded.updated_at
+        """, (guild.id, res, float(amount), now_utc_iso()))
+        conn.commit()
+        await interaction.response.send_message(
+            f"Цель обновлена: **{res}** = **{amount:,.0f} ед**".replace(",", " "), ephemeral=False
+        )
+    except Exception as e:
+        logger.exception("setneed error: %s", e)
+        await interaction.response.send_message(f"Ошибка: {e}", ephemeral=True)
+    finally:
+        conn.close()
+
+@tree.command(name="clearneeds", description="Удалить все цели (units) на этом сервере.")
+async def clearneeds_cmd(interaction: discord.Interaction):
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("Только в сервере.", ephemeral=True); return
+    conn = ensure_db_ready()
+    try:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM guild_needs_row WHERE guild_id=?", (guild.id,))
+        n = cur.rowcount or 0
+        conn.commit()
+        await interaction.response.send_message(f"Удалено целей: **{n}**.", ephemeral=False)
+    except Exception as e:
+        logger.exception("clearneeds error: %s", e)
+        await interaction.response.send_message(f"Ошибка: {e}", ephemeral=True)
+    finally:
+        conn.close()
+
+@tree.command(name="eta", description="ETA по всем целям (units) при текущей суммарной скорости (учитывает склад).")
+@app_commands.describe(resource="Опционально: конкретный ресурс", limit="Макс. строк (по умолчанию 20)")
+@app_commands.autocomplete(resource=resource_autocomplete)
+async def eta_cmd(interaction: discord.Interaction, resource: Optional[str] = None, limit: Optional[int] = 20):
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("Только в сервере.", ephemeral=True); return
+    await interaction.response.defer(ephemeral=False)
+    conn = ensure_db_ready()
+    try:
+        needs = load_guild_needs(conn, guild.id)
+        have  = load_guild_have(conn, guild.id)
+        needs_left = subtract_amounts(needs, have)
+        rph = active_production_rates(conn, guild.id)
+
+        def fmt(amount_units: float, rate: float) -> Tuple[str, float]:
+            if amount_units <= 0: return "0 ч", 0.0
+            if rate <= 0: return "— нет добычи —", float("inf")
+            hours = amount_units / rate
+            days = hours / 24.0
+            if days < 3: return f"{hours:,.1f} ч".replace(",", " "), days
+            return f"{days:,.2f} дн".replace(",", " "), days
+
+        lines: List[str] = []
+        header = "⏱️ **ETA (учитывая склад) при текущей скорости**"
+        if resource:
+            res = clean_resource_name(resource)
+            amount_total = needs.get(res)
+            if amount_total is None:
+                await interaction.followup.send(f"Для **{res}** цель не задана.", ephemeral=True); return
+            left = needs_left.get(res, 0.0)
+            eta_txt, _ = fmt(left, rph.get(res, 0.0))
+            lines.append(
+                f"**{res}** — цель {amount_total:,.0f} — на складе {have.get(res,0.0):,.0f} — осталось {left:,.0f} — сейчас {rph.get(res,0.0):,.2f}/ч — ETA: **{eta_txt}**"
+                .replace(",", " ")
+            )
+        else:
+            rows=[]
+            for res, amount_total in needs.items():
+                left = needs_left.get(res, 0.0)
+                txt, days = fmt(left, rph.get(res,0.0))
+                rows.append((res, amount_total, have.get(res,0.0), left, rph.get(res,0.0), days, txt))
+            rows.sort(key=lambda t: (t[5]==float('inf'), t[5], -t[4]), reverse=False)
+            shown=0
+            for res, amount_total, have_amt, left, rate, _days, txt in rows:
+                if shown >= int(limit or 20): break
+                lines.append(
+                    f"**{res}** — цель {amount_total:,.0f} — склад {have_amt:,.0f} — осталось {left:,.0f} — сейчас {rate:,.2f}/ч — ETA: **{txt}**"
+                    .replace(",", " ")
+                )
+                shown += 1
+            if not lines: lines.append("_Цели не заданы. Используйте `/setneed`._")
+
+        await send_long(interaction, header + "\n" + "\n".join(lines), ephemeral=False, title="ETA")
+    except Exception as e:
+        logger.exception("eta error: %s", e)
+        await interaction.followup.send(f"Ошибка: {e}", ephemeral=True)
+    finally:
+        conn.close()
+
+@tree.command(name="isk", description="Цены ресурсов (ISK/ед).")
+@app_commands.describe(action="set/show/import", resource="Ресурс (для set/show)", price="Цена (для set)", csv_prices="CSV строки: resource,price")
+@app_commands.choices(action=[
+    app_commands.Choice(name="set", value="set"),
+    app_commands.Choice(name="show", value="show"),
+    app_commands.Choice(name="import", value="import"),
+])
+@app_commands.autocomplete(resource=resource_autocomplete)
+async def isk_cmd(
+    interaction: discord.Interaction,
+    action: app_commands.Choice[str],
+    resource: Optional[str] = None,
+    price: Optional[float] = None,
+    csv_prices: Optional[str] = None
+):
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("Только в сервере.", ephemeral=True); return
+    await interaction.response.defer(ephemeral=True)
+    conn = ensure_db_ready()
+    try:
+        act = action.value.lower()
+        if act == "set":
+            if not resource or price is None:
+                await interaction.followup.send("Нужно resource и price.", ephemeral=True); return
+            set_price(conn, resource, price)
+            await interaction.followup.send(f"OK: **{clean_resource_name(resource)}** = **{price:.2f} ISK/ед**", ephemeral=False)
+        elif act == "show":
+            if resource:
+                p = get_price(conn, resource)
+                await interaction.followup.send(
+                    f"**{clean_resource_name(resource)}** = **{p:.2f} ISK/ед**" if p is not None else "Цена не задана.",
+                    ephemeral=True
+                )
+            else:
+                prices = get_prices(conn)
+                if not prices:
+                    await interaction.followup.send("Цены не заданы.", ephemeral=True)
+                else:
+                    lines = [f"- {r}: {v:.2f} ISK/ед" for r,v in sorted(prices.items())]
+                    await interaction.followup.send("**Цены (ISK/ед):**\n" + "\n".join(lines), ephemeral=True)
+        elif act == "import":
+            if not csv_prices:
+                await interaction.followup.send("Передай csv_prices: `resource,price` построчно.", ephemeral=True); return
+            import csv, io
+            f = io.StringIO(csv_prices); reader = csv.reader(f); n=0
+            for row in reader:
+                if not row: continue
+                res = clean_resource_name(row[0])
+                try: val = float(row[1])
+                except: continue
+                set_price(conn, res, val); n+=1
+            await interaction.followup.send(f"Импортировано: **{n}**.", ephemeral=True)
+        else:
+            await interaction.followup.send("Неизвестное действие.", ephemeral=True)
+    except Exception as e:
+        logger.exception("isk error: %s", e)
+        await interaction.followup.send(f"Ошибка: {e}", ephemeral=True)
+    finally:
+        conn.close()
+
+# --- парсер склада: TSV/CSV/однострочный пробельный ---
+def parse_have_table(text: str) -> List[Tuple[str, float, Optional[float]]]:
+    """
+    Поддерживает:
+    - TSV/CSV (с заголовком/без)
+    - Однострочный формат из Discord: 'ID Названия Количество Оценка стоимости 1 Lustering Alloy 13115344 7403...'
+      Запись: [ID?] <Название с пробелами> <Количество> <Итоговая_стоимость>
+    """
+    import csv, io, re
+    if not text or not text.strip():
+        return []
+
+    def to_float(x: str) -> Optional[float]:
+        try:
+            s = (x or "").strip().replace("\u00A0", "").replace(" ", "").replace(",", ".")
+            return float(s) if s else None
+        except Exception:
+            return None
+
+    txt = text.strip().replace("\r\n", "\n").replace("\r", "\n")
+
+    # Попытка TSV/CSV по строкам
+    if "\n" in txt and any(sep in txt for sep in ("\t", ",")):
+        delimiter = "\t" if "\t" in txt else ","
+        f = io.StringIO(txt)
+        reader = csv.reader(f, delimiter=delimiter)
+        rows = [r for r in reader if any((c or "").strip() for c in r)]
+        if not rows:
+            return []
+
+        header = [c.strip().lower() for c in rows[0]]
+        has_header = any(k in " ".join(header) for k in ["назван", "name", "resource", "колич", "amount", "оцен", "стоим", "value", "price"])
+
+        def find_col(cands: List[str], default: int) -> int:
+            if has_header:
+                for i, c in enumerate(header):
+                    if any(x in c for x in cands):
+                        return i
+            return default
+
+        col_name   = find_col(["назв", "name", "resource", "ресур"], 1 if len(rows[0]) > 1 else 0)
+        col_amount = find_col(["колич", "amount", "qty", "объём", "шт"], 2 if len(rows[0]) > 2 else (1 if len(rows[0])>1 else 0))
+        col_total  = find_col(["оцен", "стоим", "total", "value", "сумм"], 3 if len(rows[0]) > 3 else -1)
+
+        out: List[Tuple[str, float, Optional[float]]] = []
+        start = 1 if has_header else 0
+        for r in rows[start:]:
+            shift = 1 if r and (r[0] or "").strip().isdigit() else 0
+            def get(idx: int) -> Optional[str]:
+                j = idx + shift
+                return r[j] if 0 <= j < len(r) else None
+            name = clean_resource_name(get(col_name) or "")
+            if not name: continue
+            amount = to_float(get(col_amount) or "")
+            if amount is None: continue
+            unit_price = None
+            if col_total >= 0:
+                total = to_float(get(col_total) or "")
+                if total is not None and amount != 0:
+                    unit_price = total / amount
+            out.append((name, float(amount), unit_price))
+        return out
+
+    # Однострочный пробельный ввод
+    tokens = re.findall(r"\S+", txt)
+    header_words = {"ID", "Названия", "Количество", "Оценка", "стоимости", "Name", "Amount", "Total", "Value"}
+    if any(t in header_words for t in tokens[:10]):
+        tokens = [t for t in tokens if t not in header_words]
+
+    out: List[Tuple[str, float, Optional[float]]] = []
+    i, n = 0, len(tokens)
+    while i < n:
+        if i < n and tokens[i].isdigit():
+            i += 1
+        j = i; found = False
+        while j + 1 < n:
+            a = to_float(tokens[j]); b = to_float(tokens[j+1])
+            if a is not None and b is not None:
+                found = True; break
+            j += 1
+        if not found:
+            # формат с одним числом (только amount)
+            k, last_num_idx = i, -1
+            while k < n:
+                if to_float(tokens[k]) is not None:
+                    last_num_idx = k
+                k += 1
+            if last_num_idx == -1 or last_num_idx == i:
+                break
+            name_tokens = tokens[i:last_num_idx]
+            if name_tokens and name_tokens[0].isdigit():
+                name_tokens = name_tokens[1:]
+            name = " ".join(name_tokens).strip()
+            amount = to_float(tokens[last_num_idx])
+            if name and amount is not None:
+                out.append((name, float(amount), None))
+            break
+
+        name_tokens = tokens[i:j]
+        if name_tokens and name_tokens[0].isdigit():
+            name_tokens = name_tokens[1:]
+        name = " ".join(name_tokens).strip()
+        amount = to_float(tokens[j])
+        total  = to_float(tokens[j+1])
+        unit_price = (total / amount) if (amount not in (None, 0) and total is not None) else None
+        if name and amount is not None:
+            out.append((name, float(amount), unit_price))
+        i = j + 2
+    return out
+
+def upsert_have(conn: sqlite3.Connection, guild_id: int, items: List[Tuple[str, float, Optional[float]]]) -> int:
+    cur = conn.cursor()
+    n = 0
+    for resource, amount, unit_price in items:
+        resource = clean_resource_name(resource)
+        if not resource: continue
+        if amount < 0: amount = 0.0
+        cur.execute("""
+            INSERT INTO guild_have(guild_id, resource, amount_units, unit_price, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(guild_id, resource) DO UPDATE
+              SET amount_units=excluded.amount_units,
+                  unit_price=COALESCE(excluded.unit_price, guild_have.unit_price),
+                  updated_at=excluded.updated_at
+        """, (guild_id, resource, float(amount), float(unit_price) if unit_price is not None else None, now_utc_iso()))
+        n += 1
+    conn.commit()
+    return n
+
+@tree.command(name="have", description="Импорт/просмотр склада: цели уменьшаются на эти остатки; цены берутся из оценки/шт.")
+@app_commands.describe(action="import/show/clear", data="Вставь таблицу (TSV/CSV) или одно строкой: [ID] Название Количество [Оценка]")
+@app_commands.choices(action=[
+    app_commands.Choice(name="import", value="import"),
+    app_commands.Choice(name="show",   value="show"),
+    app_commands.Choice(name="clear",  value="clear"),
+])
+async def have_cmd(interaction: discord.Interaction, action: app_commands.Choice[str], data: Optional[str] = None):
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("Только в сервере.", ephemeral=True); return
+    await interaction.response.defer(ephemeral=True)
+    conn = ensure_db_ready()
+    try:
+        act = action.value.lower()
+        if act == "import":
+            if not data or not data.strip():
+                await interaction.followup.send("Вставь таблицу в параметр `data` (TSV/CSV или одной строкой).", ephemeral=True); return
+            items = parse_have_table(data)
+            if not items:
+                await interaction.followup.send("Не удалось распарсить данные. Проверь колонки/формат.", ephemeral=True); return
+            n = upsert_have(conn, guild.id, items)
+
+            # Дополнительно запишем unit_price в isk_price (чтобы /isk show видел эти цены)
+            for res, _amt, unit_price in items:
+                if unit_price is not None:
+                    set_price(conn, res, unit_price)
+
+            total_items = len(items)
+            with_prices = sum(1 for _,_,p in items if p is not None)
+            await interaction.followup.send(f"✅ Импортировано позиций: **{n}/{total_items}** (с ценой: **{with_prices}**).", ephemeral=False)
+
+        elif act == "show":
+            cur = conn.cursor()
+            cur.execute("""SELECT resource, amount_units, unit_price FROM guild_have WHERE guild_id=? ORDER BY resource""", (guild.id,))
+            rows = cur.fetchall()
+            if not rows:
+                await interaction.followup.send("Склад пуст. Используй `/have import`.", ephemeral=True); return
+            lines=[]
+            for r in rows[:50]:
+                res = r["resource"]; amt = float(r["amount_units"]); up = r["unit_price"]
+                tail = f" · ≈ {up:.2f} ISK/ед" if up is not None else ""
+                lines.append(f"- {res}: **{amt:,.0f}**{tail}".replace(",", " "))
+            more = "" if len(rows) <= 50 else f"\n… и ещё {len(rows)-50} строк."
+            await interaction.followup.send("**Склад:**\n" + "\n".join(lines) + more, ephemeral=False)
+
+        elif act == "clear":
+            cur = conn.cursor()
+            cur.execute("DELETE FROM guild_have WHERE guild_id=?", (guild.id,))
+            n = cur.rowcount or 0
+            conn.commit()
+            await interaction.followup.send(f"🧹 Очищено записей склада: **{n}**.", ephemeral=True)
+        else:
+            await interaction.followup.send("Неизвестное действие.", ephemeral=True)
+    except Exception as e:
+        logger.exception("have error: %s", e)
+        await interaction.followup.send(f"Ошибка: {e}", ephemeral=True)
+    finally:
+        conn.close()
+
+# --- ADDPOS ---
+@tree.command(
+    name="addpos",
+    description="Создать/обновить POS (имя как в игре) и автоматически выставить планеты/буры под цели."
+)
+@app_commands.describe(
+    name="Имя POS (как в игре)",
+    system="Система (например, O3L-95)",
+    slots="Сколько планет-слотов назначать (по умолчанию 10)",
+    drills="Сколько буров ставить на планету (по умолчанию 22)",
+)
+@app_commands.autocomplete(system=system_autocomplete)
+async def addpos_cmd(
+    interaction: discord.Interaction,
+    name: str,
+    system: str,
+    slots: Optional[int] = None,
+    drills: Optional[int] = None,
+):
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("Только в сервере.", ephemeral=True); return
+    await interaction.response.defer(ephemeral=True)
+
+    slots_val  = DEFAULT_SLOTS if (slots is None) else int(slots)
+    drills_val = DEFAULT_DRILLS if (drills is None) else int(drills)
+
+    if slots_val <= 0 or slots_val > 20:
+        await interaction.followup.send("`slots` должен быть в диапазоне 1..20.", ephemeral=True); return
+    if drills_val <= 0 or drills_val > 50:
+        await interaction.followup.send("`drills` должен быть в диапазоне 1..50.", ephemeral=True); return
+
+    gid = guild.id
+    uid = interaction.user.id
+    conn = ensure_db_ready()
+    try:
+        constellation = find_constellation_by_system(conn, system)
+        if not constellation:
+            await interaction.followup.send(f"Система **{system}** не найдена в базе.", ephemeral=True); return
+
+        cur = conn.cursor()
+        cur.execute("SELECT id, owner_user_id FROM pos WHERE guild_id=? AND name=? LIMIT 1", (gid, name))
+        r = cur.fetchone()
+        if r:
+            pos_id = int(r["id"])
+            owner_id = int(r["owner_user_id"])
+            if not (is_admin_user(interaction) or owner_id == uid):
+                await interaction.followup.send("⛔ Этот POS принадлежит другому пользователю.", ephemeral=True)
+                return
+            cur.execute("UPDATE pos SET system=?, constellation=?, updated_at=? WHERE id=?",
+                        (system, constellation, now_utc_iso(), pos_id))
+            cur.execute("DELETE FROM pos_planet WHERE pos_id=?", (pos_id,))
+            conn.commit()
+        else:
+            cur.execute("""INSERT INTO pos(guild_id, owner_user_id, name, system, constellation, created_at, updated_at)
+                           VALUES(?,?,?,?,?,?,?)""",
+                        (gid, uid, name, system, constellation, now_utc_iso(), now_utc_iso()))
+            pos_id = cur.lastrowid
+            conn.commit()
+
+        needs_units = load_guild_needs(conn, gid)
+        have_units  = load_guild_have(conn, gid)
+        needs_after_have = subtract_amounts(needs_units, have_units)
+        coverage_units = active_assignments_coverage(conn, gid, DEFAULT_HOURS)
+        rest_units = subtract_amounts(needs_after_have, coverage_units)
+
+        prices_have = load_have_prices(conn, gid)
+        prices_general = get_prices(conn)
+        merged_prices = prices_general.copy(); merged_prices.update(prices_have)  # склад перекрывает общие
+
+        assignments, k_cover = plan_assignments(
+            conn=conn,
+            guild_id=gid,
+            constellation=constellation,
+            rest_units=rest_units,
+            horizon_hours=DEFAULT_HOURS,
+            slots=slots_val,
+            drills=drills_val,
+            beta=DEFAULT_BETA,
+            k_cover=3,
+            prices=merged_prices
+        )
+
+        upsert_assignments(conn, pos_id, assignments)
+
+        msg = (
+            f"✅ POS **{name}** ({system}, {constellation}) обновлён.\n"
+            f"Слотов: **{slots_val}**, буров/планету: **{drills_val}**.\n"
+            f"Расчёт целей: **цели − склад − текущая добыча**.\n\n"
+            + format_discord_response(system, assignments, k_cover)
+        )
+        await interaction.followup.send(msg, ephemeral=True)
+
+    except Exception as e:
+        logger.exception("addpos error: %s", e)
+        await interaction.followup.send(f"Ошибка: {e}", ephemeral=True)
+    finally:
+        conn.close()
+
+@tree.command(name="delpos", description="Удалить один POS (если без id — покажу список).")
+@app_commands.describe(pos_id="ID POS")
+async def delpos_cmd(interaction: discord.Interaction, pos_id: Optional[int] = None):
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("Только в сервере.", ephemeral=True); return
+    await interaction.response.defer(ephemeral=True)
+    conn = ensure_db_ready()
+    try:
+        cur = conn.cursor()
+        if pos_id is None:
+            cur.execute("SELECT id, name, system, constellation, created_at FROM pos WHERE guild_id=? ORDER BY id DESC", (guild.id,))
+            rows = cur.fetchall()
+            if not rows:
+                await interaction.followup.send("POS-ов нет.", ephemeral=True); return
+            lines = [f"ID **{r['id']}** — {r['name']} ({r['system']}, {r['constellation']}) · создан {r['created_at']}" for r in rows[:25]]
+            await interaction.followup.send("Укажи `/delpos pos_id:<ID>`:\n" + "\n".join(lines), ephemeral=True)
+            return
+
+        cur.execute("SELECT id FROM pos WHERE id=? AND guild_id=?", (pos_id, guild.id))
+        if not cur.fetchone():
+            await interaction.followup.send("POS не найден.", ephemeral=True); return
+
+        if not ensure_owner_or_admin(conn, interaction, pos_id):
+            await interaction.followup.send("⛔ Удалять может только владелец POS или админ сервера.", ephemeral=True)
+            return
+
+        cur.execute("DELETE FROM pos_planet WHERE pos_id=?", (pos_id,))
+        cur.execute("DELETE FROM pos WHERE id=?", (pos_id,))
+        conn.commit()
+        await interaction.followup.send(f"🗑️ POS **{pos_id}** удалён.", ephemeral=True)
+    except Exception as e:
+        logger.exception("delpos error: %s", e)
+        await interaction.followup.send(f"Ошибка: {e}", ephemeral=True)
+    finally:
+        conn.close()
+
+@tree.command(name="delallpos", description="Удалить все POS на сервере.")
+async def delallpos_cmd(interaction: discord.Interaction):
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("Только в сервере.", ephemeral=True); return
+    await interaction.response.defer(ephemeral=True)
+    if not is_admin_user(interaction):
+        await interaction.followup.send("⛔ Команда доступна только администраторам сервера.", ephemeral=True)
+        return
+    conn = ensure_db_ready()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM pos WHERE guild_id=?", (guild.id,))
+        ids = [r["id"] for r in cur.fetchall()]
+        if ids:
+            cur.execute("DELETE FROM pos_planet WHERE pos_id IN (%s)" % ",".join("?"*len(ids)), ids)
+            cur.execute("DELETE FROM pos WHERE guild_id=?", (guild.id,))
+            conn.commit()
+        await interaction.followup.send(f"🧹 Удалено POS-ов: **{len(ids)}**.", ephemeral=True)
+    except Exception as e:
+        logger.exception("delallpos error: %s", e)
+        await interaction.followup.send(f"Ошибка: {e}", ephemeral=True)
+    finally:
+        conn.close()
+
+@tree.command(name="mypos", description="Показать мои POS на сервере.")
+async def mypos_cmd(interaction: discord.Interaction):
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("Только в сервере.", ephemeral=True); return
+    await interaction.response.defer(ephemeral=True)
+    conn = ensure_db_ready()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, name, system, constellation, created_at, updated_at
+            FROM pos
+            WHERE guild_id=? AND owner_user_id=?
+            ORDER BY id DESC
+        """, (guild.id, interaction.user.id))
+        rows = cur.fetchall()
+        if not rows:
+            await interaction.followup.send("У тебя ещё нет POS-ов.", ephemeral=True); return
+        lines = [
+            f"ID **{r['id']}** — {r['name']} ({r['system']}, {r['constellation']}) · создан {r['created_at']} · обновлён {r['updated_at']}"
+            for r in rows[:25]
+        ]
+        await interaction.followup.send("\n".join(lines), ephemeral=True)
+    except Exception as e:
+        logger.exception("mypos error: %s", e)
+        await interaction.followup.send(f"Ошибка: {e}", ephemeral=True)
+    finally:
+        conn.close()
+
+@tree.command(name="posstats", description="Статистика POS на сервере: всего и по владельцам.")
+async def posstats_cmd(interaction: discord.Interaction):
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("Только в сервере.", ephemeral=True); return
+    await interaction.response.defer(ephemeral=False)
+    conn = ensure_db_ready()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) AS c FROM pos WHERE guild_id=?", (guild.id,))
+        total = int(cur.fetchone()["c"])
+        cur.execute("""
+            SELECT owner_user_id, COUNT(*) AS c
+            FROM pos
+            WHERE guild_id=?
+            GROUP BY owner_user_id
+            ORDER BY c DESC, owner_user_id ASC
+        """, (guild.id,))
+        rows = cur.fetchall()
+        owners_total = len(rows)
+        my_count = 0
+        lines = []
+        for r in rows[:25]:
+            uid = int(r["owner_user_id"])
+            cnt = int(r["c"])
+            if uid == interaction.user.id:
+                my_count = cnt
+            member = guild.get_member(uid)
+            mention = member.mention if member else f"<@{uid}>"
+            lines.append(f"{mention}: **{cnt}**")
+        header = f"**POS на сервере:** {total}\n**Владельцев:** {owners_total}\n**У тебя:** {my_count}"
+        body = "**Топ по владельцам:**\n" + ("\n".join(lines) if lines else "_нет POS_")
+        await interaction.followup.send(header + "\n\n" + body, ephemeral=False)
+    except Exception as e:
+        logger.exception("posstats error: %s", e)
+        await interaction.followup.send(f"Ошибка: {e}", ephemeral=True)
+    finally:
+        conn.close()
+
+# --- НОВОЕ: мои назначения (планеты/буры) ---
+@tree.command(name="myassigns", description="Список планет/буров по моим POS (опционально по одному POS).")
+@app_commands.describe(pos_id="Фильтровать по ID POS (опционально)")
+async def myassigns_cmd(interaction: discord.Interaction, pos_id: Optional[int] = None):
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("Только в сервере.", ephemeral=True); return
+    await interaction.response.defer(ephemeral=True)
+    conn = ensure_db_ready()
+    try:
+        cur = conn.cursor()
+        if pos_id is not None:
+            cur.execute("""
+                SELECT id, name, system, constellation
+                FROM pos
+                WHERE guild_id=? AND id=? AND owner_user_id=?
+            """, (guild.id, pos_id, interaction.user.id))
+            pos_rows = cur.fetchall()
+            if not pos_rows:
+                await interaction.followup.send("POS не найден или принадлежит другому пользователю.", ephemeral=True); return
+        else:
+            cur.execute("""
+                SELECT id, name, system, constellation
+                FROM pos
+                WHERE guild_id=? AND owner_user_id=?
+                ORDER BY id DESC
+            """, (guild.id, interaction.user.id))
+            pos_rows = cur.fetchall()
+            if not pos_rows:
+                await interaction.followup.send("У тебя ещё нет POS-ов.", ephemeral=True); return
+
+        lines = []
+        for p in pos_rows:
+            pid = int(p["id"])
+            lines.append(f"**POS {p['name']}** (ID {pid}) — {p['system']}, {p['constellation']}")
+            cur.execute("""
+                SELECT
+                    pp.planet_id,
+                    pp.resource,
+                    pp.drills_count,
+                    pp.rate,
+                    pr.system AS pr_system,
+                    pr.planet_name AS pr_planet
+                FROM pos_planet pp
+                LEFT JOIN planet_resources pr
+                  ON (CASE WHEN typeof(pr.planet_id)='integer' AND pr.planet_id>0
+                           THEN pr.planet_id ELSE pr.rowid END) = pp.planet_id
+                WHERE pp.pos_id=?
+                ORDER BY pp.resource, pp.planet_id
+            """, (pid,))
+            arows = cur.fetchall()
+            if not arows:
+                lines.append("  _Назначений нет._")
+                continue
+            for r in arows:
+                total_rate = float(r["rate"]) * int(r["drills_count"])
+                sys = r["pr_system"] or "?"
+                planet = r["pr_planet"] or f"#{r['planet_id']}"
+                lines.append(
+                    f"- {sys} · {planet} · **{r['resource']}** · drills={r['drills_count']} · "
+                    f"base={float(r['rate']):.2f}/h/bore → **{total_rate:,.2f}/ч**".replace(",", " ")
+                )
+            lines.append("")
+        await send_long(interaction, "\n".join(lines), ephemeral=True, title="Мои назначения")
+    except Exception as e:
+        logger.exception("myassigns error: %s", e)
+        await interaction.followup.send(f"Ошибка: {e}", ephemeral=True)
+    finally:
+        conn.close()
+
+# --- НОВОЕ: POS конкретного пользователя ---
+@tree.command(name="userpos", description="Список POS указанного пользователя на сервере.")
+@app_commands.describe(user="Пользователь (упоминание или выбор из списка)")
+async def userpos_cmd(interaction: discord.Interaction, user: discord.User):
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("Только в сервере.", ephemeral=True); return
+    await interaction.response.defer(ephemeral=False)
+    conn = ensure_db_ready()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, name, system, constellation, created_at, updated_at
+            FROM pos
+            WHERE guild_id=? AND owner_user_id=?
+            ORDER BY id DESC
+        """, (guild.id, user.id))
+        rows = cur.fetchall()
+
+        member = guild.get_member(user.id)
+        mention = member.mention if member else f"<@{user.id}>"
+
+        if not rows:
+            await interaction.followup.send(f"У {mention} нет POS-ов.", ephemeral=False)
+            return
+
+        lines = [f"**POS пользователя {mention}: {len(rows)}**", ""]
+        for r in rows[:50]:
+            lines.append(
+                f"ID **{r['id']}** — {r['name']} ({r['system']}, {r['constellation']}) · "
+                f"создан {r['created_at']} · обновлён {r['updated_at']}"
+            )
+        if len(rows) > 50:
+            lines.append(f"\n… и ещё {len(rows)-50} записей.")
+
+        await send_long(interaction, "\n".join(lines), ephemeral=False, title="POS пользователя")
+    except Exception as e:
+        logger.exception("userpos error: %s", e)
+        await interaction.followup.send(f"Ошибка: {e}", ephemeral=True)
+    finally:
+        conn.close()
+
+# ==================== СТАРТ ====================
+@bot.event
+async def on_ready():
+    logger.info("Logged in as %s (%s)", bot.user, bot.user.id if bot.user else "?")
+    try:
+        await tree.sync()
+        logger.info("Application commands synced.")
+    except Exception as e:
+        logger.exception("Failed to sync commands: %s", e)
+
+def main():
+    raw_token = os.environ.get("DISCORD_TOKEN")
+    if not raw_token:
+        logger.error("Discord token не найден в переменной окружения DISCORD_TOKEN.")
+        raise SystemExit(1)
+    token = validate_and_clean_token(raw_token)
+    if not token:
+        logger.error("Discord token из ENV некорректен. Проверьте значение.")
+        raise SystemExit(1)
+    logger.info("Использую токен из ENV:DISCORD_TOKEN")
+    try:
+        bot.run(token)
+    except discord.errors.LoginFailure:
+        logger.error(
+            "LoginFailure: Discord отклонил токен (401 Unauthorized). "
+            "Скорее всего токен устарел/сброшен или скопирован не полностью. "
+            "Зайдите в Discord Developer Portal → Your App → Bot → Reset Token и обновите переменную окружения."
+        )
+        raise
+
+if __name__ == "__main__":
+    main()
+
