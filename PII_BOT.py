@@ -551,17 +551,17 @@ def upsert_assignments(conn: sqlite3.Connection, pos_id: int, assignments: List[
     conn.commit()
 
 def format_discord_response(system: str, assignments: List[Assignment], k_cover: int) -> str:
-    k_farm = max(0, len(assignments) - k_cover)
-    lines = [f"Назначения для POS в **{system}** (ед/час):", f"COVER={k_cover}, FARM={k_farm}", ""]
+    lines = [f"Назначения для POS в **{system}** (ед/час):", f"COVER={k_cover}", ""]
     if not assignments:
         lines.append("_Ничего не подобрано._")
         return "\n".join(lines)
     for i, a in enumerate(assignments, 1):
-        tag = "COVER" if i <= k_cover else "FARM"
+        tag = "COVER" if i <= k_cover else ""
         total_rate = a.rate * a.drills
         tail = f" · ≈ {a.isk_per_hour:,.0f} ISK/h".replace(",", " ") if a.isk_per_hour else ""
+        prefix = f"[{tag}] " if tag else ""
         lines.append(
-            f"[{tag}] {a.system} · {a.planet_name} · **{a.resource}** · drills={a.drills} · "
+            f"{prefix}{a.system} · {a.planet_name} · **{a.resource}** · drills={a.drills} · "
             f"base={a.base_out:.2f}/h/bore → **{total_rate:,.2f}/ч**{tail}".replace(",", " ")
         )
     return "\n".join(lines)
