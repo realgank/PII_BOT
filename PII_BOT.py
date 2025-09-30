@@ -589,6 +589,204 @@ def format_discord_response(assignments: List[Assignment]) -> str:
         )
     return "\n".join(lines)
 
+def compute_pos_assignments(
+    conn: sqlite3.Connection,
+    guild_id: int,
+    constellation: str,
+    slots: int,
+    drills: int,
+) -> List[Assignment]:
+    needs_units = load_guild_needs(conn, guild_id)
+    have_units = load_guild_have(conn, guild_id)
+    needs_after_have = subtract_amounts(needs_units, have_units)
+    coverage_units = active_assignments_coverage(conn, guild_id, DEFAULT_HOURS)
+    rest_units = subtract_amounts(needs_after_have, coverage_units)
+
+    prices_have = load_have_prices(conn, guild_id)
+    prices_general = get_prices(conn)
+    merged_prices = dict(prices_general)
+    merged_prices.update(prices_have)
+
+    return plan_assignments(
+        conn=conn,
+        guild_id=guild_id,
+        constellation=constellation,
+        rest_units=rest_units,
+        horizon_hours=DEFAULT_HOURS,
+        slots=slots,
+        drills=drills,
+        beta=DEFAULT_BETA,
+        prices=merged_prices,
+    )
+
+def build_pos_assignment_message(
+    name: str,
+    system: str,
+    constellation: str,
+    assignments: List[Assignment],
+    slots_val: int,
+    drills_val: int,
+    defaults: Dict[str, object],
+    slots_override: bool,
+    drills_override: bool,
+) -> str:
+    def format_source(overridden: bool) -> str:
+        if overridden:
+            return "указано вручную"
+        label = describe_pos_defaults_source(str(defaults.get("source", "env")))
+        ts = defaults.get("updated_at")
+        return f"{label} (обновлено {ts})" if ts else label
+
+    assignment_text = format_discord_response(assignments)
+    return (
+        f"✅ POS **{name}** ({system}, {constellation}) обновлён.\n"
+        f"Слотов: **{slots_val}** ({format_source(slots_override)}), "
+        f"буров/планету: **{drills_val}** ({format_source(drills_override)}).\n"
+        f"Расчёт целей: **цели − склад − текущая добыча**.\n\n"
+        f"Назначения для POS в **{system}** (ед/час):\n"
+        f"{assignment_text}"
+    )
+
+class RefreshPosModal(discord.ui.Modal):
+    def __init__(self, guild_id: int, defaults: Dict[str, object]):
+        super().__init__(title="Обновить POS")
+        self.guild_id = guild_id
+        self.defaults = defaults
+        self.default_slots = int(defaults.get("slots", DEFAULT_SLOTS))
+        self.default_drills = int(defaults.get("drills", DEFAULT_DRILLS))
+
+        self.slots_input = discord.ui.TextInput(
+            label="Количество слотов",
+            required=False,
+            placeholder=f"Оставь пустым — по умолчанию {self.default_slots}",
+            style=discord.TextStyle.short,
+        )
+        self.drills_input = discord.ui.TextInput(
+            label="Количество буров на планету",
+            required=False,
+            placeholder=f"Оставь пустым — по умолчанию {self.default_drills}",
+            style=discord.TextStyle.short,
+        )
+        self.add_item(self.slots_input)
+        self.add_item(self.drills_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        ephemeral = interaction.guild is not None
+        await interaction.response.defer(thinking=True, ephemeral=ephemeral)
+
+        conn = ensure_db_ready()
+        try:
+            defaults = get_effective_pos_defaults(conn, self.guild_id, interaction.user.id)
+            base_slots = int(defaults.get("slots", self.default_slots))
+            base_drills = int(defaults.get("drills", self.default_drills))
+
+            slots_val = base_slots
+            drills_val = base_drills
+            slots_override = False
+            drills_override = False
+
+            raw_slots = (self.slots_input.value or "").strip()
+            if raw_slots:
+                try:
+                    slots_val = int(raw_slots)
+                except ValueError:
+                    await interaction.followup.send("`slots` должен быть целым числом.", ephemeral=ephemeral)
+                    return
+                err = _validate_default_bounds(slots_val, "slots")
+                if err:
+                    await interaction.followup.send(err, ephemeral=ephemeral)
+                    return
+                slots_override = True
+
+            raw_drills = (self.drills_input.value or "").strip()
+            if raw_drills:
+                try:
+                    drills_val = int(raw_drills)
+                except ValueError:
+                    await interaction.followup.send("`drills` должен быть целым числом.", ephemeral=ephemeral)
+                    return
+                err = _validate_default_bounds(drills_val, "drills")
+                if err:
+                    await interaction.followup.send(err, ephemeral=ephemeral)
+                    return
+                drills_override = True
+
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT id, name, system, constellation
+                FROM pos
+                WHERE guild_id=? AND owner_user_id=?
+                ORDER BY name
+                """,
+                (self.guild_id, interaction.user.id),
+            )
+            rows = cur.fetchall()
+            if not rows:
+                await interaction.followup.send("Для этого сервера у тебя нет POS.", ephemeral=ephemeral)
+                return
+
+            messages: List[str] = []
+            for row in rows:
+                pos_id = int(row["id"])
+                name = row["name"]
+                system = row["system"]
+                constellation = row["constellation"]
+
+                cur.execute("DELETE FROM pos_planet WHERE pos_id=?", (pos_id,))
+                assignments = compute_pos_assignments(
+                    conn=conn,
+                    guild_id=self.guild_id,
+                    constellation=constellation,
+                    slots=slots_val,
+                    drills=drills_val,
+                )
+                upsert_assignments(conn, pos_id, assignments)
+                cur.execute("UPDATE pos SET updated_at=? WHERE id=?", (now_utc_iso(), pos_id))
+                conn.commit()
+
+                messages.append(
+                    build_pos_assignment_message(
+                        name=name,
+                        system=system,
+                        constellation=constellation,
+                        assignments=assignments,
+                        slots_val=slots_val,
+                        drills_val=drills_val,
+                        defaults=defaults,
+                        slots_override=slots_override,
+                        drills_override=drills_override,
+                    )
+                )
+
+            full_message = "\n\n".join(messages)
+            await send_long(
+                interaction,
+                full_message,
+                ephemeral=ephemeral,
+                title="Обновление POS",
+            )
+
+        except Exception as e:
+            logger.exception("refresh_pos_modal error: %s", e)
+            await interaction.followup.send(f"Ошибка: {e}", ephemeral=ephemeral)
+        finally:
+            conn.close()
+
+class RefreshPosView(discord.ui.View):
+    def __init__(self, guild_id: int):
+        super().__init__(timeout=None)
+        self.guild_id = guild_id
+
+    @discord.ui.button(label="Обновить", style=discord.ButtonStyle.primary, custom_id="refresh_pos_button")
+    async def refresh_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        conn = ensure_db_ready()
+        try:
+            defaults = get_effective_pos_defaults(conn, self.guild_id, interaction.user.id)
+        finally:
+            conn.close()
+        await interaction.response.send_modal(RefreshPosModal(self.guild_id, defaults))
+
 # ==================== ПРАВА ====================
 def get_pos_owner(conn: sqlite3.Connection, pos_id: int) -> Optional[int]:
     cur = conn.cursor()
@@ -1199,46 +1397,26 @@ async def addpos_cmd(
             pos_id = cur.lastrowid
             conn.commit()
 
-        needs_units = load_guild_needs(conn, gid)
-        have_units  = load_guild_have(conn, gid)
-        needs_after_have = subtract_amounts(needs_units, have_units)
-        coverage_units = active_assignments_coverage(conn, gid, DEFAULT_HOURS)
-        rest_units = subtract_amounts(needs_after_have, coverage_units)
-
-        prices_have = load_have_prices(conn, gid)
-        prices_general = get_prices(conn)
-        merged_prices = prices_general.copy(); merged_prices.update(prices_have)  # склад перекрывает общие
-
-        assignments = plan_assignments(
+        assignments = compute_pos_assignments(
             conn=conn,
             guild_id=gid,
             constellation=constellation,
-            rest_units=rest_units,
-            horizon_hours=DEFAULT_HOURS,
             slots=slots_val,
             drills=drills_val,
-            beta=DEFAULT_BETA,
-            prices=merged_prices
         )
 
         upsert_assignments(conn, pos_id, assignments)
 
-        def format_source(overridden: bool) -> str:
-            if overridden:
-                return "указано в команде"
-            label = describe_pos_defaults_source(defaults["source"])
-            ts = defaults.get("updated_at")
-            return f"{label} (обновлено {ts})" if ts else label
-
-        assignment_text = format_discord_response(assignments)
-
-        msg = (
-            f"✅ POS **{name}** ({system}, {constellation}) обновлён.\n"
-            f"Слотов: **{slots_val}** ({format_source(slots_override)}), "
-            f"буров/планету: **{drills_val}** ({format_source(drills_override)}).\n"
-            f"Расчёт целей: **цели − склад − текущая добыча**.\n\n"
-            f"Назначения для POS в **{system}** (ед/час):\n"
-            f"{assignment_text}"
+        msg = build_pos_assignment_message(
+            name=name,
+            system=system,
+            constellation=constellation,
+            assignments=assignments,
+            slots_val=slots_val,
+            drills_val=drills_val,
+            defaults=defaults,
+            slots_override=slots_override,
+            drills_override=drills_override,
         )
         await interaction.followup.send(msg, ephemeral=True)
 
@@ -1247,6 +1425,82 @@ async def addpos_cmd(
         await interaction.followup.send(f"Ошибка: {e}", ephemeral=True)
     finally:
         conn.close()
+
+@tree.command(name="refreshpos", description="Сбросить все POS и запросить обновление у владельцев.")
+async def refreshpos_cmd(interaction: discord.Interaction):
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("Только в сервере.", ephemeral=True)
+        return
+    if not is_admin_user(interaction):
+        await interaction.response.send_message("⛔ Команда доступна только администраторам сервера.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    conn = ensure_db_ready()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT id, owner_user_id FROM pos WHERE guild_id=?", (guild.id,))
+        rows = cur.fetchall()
+        if not rows:
+            await interaction.followup.send("На сервере нет POS для обновления.", ephemeral=True)
+            return
+
+        owner_ids = sorted({int(r["owner_user_id"]) for r in rows if r["owner_user_id"] is not None})
+
+        cur.execute(
+            "DELETE FROM pos_planet WHERE pos_id IN (SELECT id FROM pos WHERE guild_id=?)",
+            (guild.id,),
+        )
+        deleted_assignments = cur.rowcount or 0
+        conn.commit()
+    except Exception as e:
+        logger.exception("refreshpos error: %s", e)
+        await interaction.followup.send(f"Ошибка: {e}", ephemeral=True)
+        return
+    finally:
+        conn.close()
+
+    notified = 0
+    failed: List[int] = []
+    for owner_id in owner_ids:
+        user = interaction.client.get_user(owner_id)
+        if user is None:
+            try:
+                user = await interaction.client.fetch_user(owner_id)
+            except Exception as e:
+                logger.warning("Не удалось получить пользователя %s: %s", owner_id, e)
+                user = None
+        if user is None:
+            failed.append(owner_id)
+            continue
+
+        view = RefreshPosView(guild.id)
+        message = (
+            f"👋 Привет! Администратор сервера **{guild.name}** сбросил назначения POS.\n"
+            "Нажми кнопку ниже, чтобы выбрать количество слотов и буров и получить новый список планет.\n"
+            "Оставь поля пустыми, чтобы взять сохранённые значения по умолчанию."
+        )
+        try:
+            await user.send(message, view=view)
+            notified += 1
+        except discord.Forbidden:
+            failed.append(owner_id)
+        except Exception as e:
+            logger.exception("Не удалось отправить DM пользователю %s: %s", owner_id, e)
+            failed.append(owner_id)
+
+    summary_lines = [
+        f"Сброшено назначений: **{deleted_assignments}**.",
+        f"Владельцев POS: **{len(owner_ids)}**.",
+        f"Сообщений отправлено: **{notified}**.",
+    ]
+    if failed:
+        failed_mentions = ", ".join(f"<@{uid}>" for uid in failed)
+        summary_lines.append("Не удалось отправить: " + failed_mentions)
+
+    await interaction.followup.send("\n".join(summary_lines), ephemeral=True)
 
 @tree.command(name="delpos", description="Удалить один POS (если без id — покажу список).")
 @app_commands.describe(pos_id="ID POS")
