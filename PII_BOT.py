@@ -3,10 +3,12 @@ import os
 import logging
 import sqlite3
 import pathlib
+import asyncio
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime, timezone, timedelta
 import re
 import base64
+from collections import OrderedDict
 
 import discord
 from discord import app_commands
@@ -23,6 +25,11 @@ DEFAULT_SLOTS = int(os.getenv("DEFAULT_SLOTS", "10"))
 DEFAULT_DRILLS = int(os.getenv("DEFAULT_DRILLS", "22"))
 DEFAULT_HOURS = int(os.getenv("DEFAULT_HOURS", "168"))  # горизонт для покрытия в расчётах
 DEFAULT_BETA = float(os.getenv("DEFAULT_BETA", "0.85"))
+
+RES_REMINDER_DELAY_HOURS = int(os.getenv("RES_REMINDER_DELAY_HOURS", "24"))
+RES_REMINDER_CHECK_SECONDS = int(os.getenv("RES_REMINDER_CHECK_SECONDS", str(60 * 60)))
+
+reminder_task: Optional[asyncio.Task] = None
 
 # ==================== ЛОГИ ====================
 LOG_LEVEL = getattr(logging, LOG_LEVEL_NAME.upper(), logging.INFO)
@@ -224,11 +231,45 @@ DDL = [
         FOREIGN KEY (ping_id) REFERENCES resource_ping(id) ON DELETE CASCADE
     );
     """,
+    """
+    CREATE TABLE IF NOT EXISTS resource_ping_submission_item (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        ping_id      INTEGER NOT NULL,
+        guild_id     INTEGER NOT NULL,
+        user_id      INTEGER NOT NULL,
+        resource     TEXT NOT NULL,
+        amount_units REAL NOT NULL,
+        unit_price   REAL,
+        submitted_at TEXT NOT NULL,
+        UNIQUE(ping_id, user_id, resource),
+        FOREIGN KEY (ping_id) REFERENCES resource_ping(id) ON DELETE CASCADE
+    );
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS resource_ping_reminder (
+        ping_id          INTEGER NOT NULL,
+        user_id          INTEGER NOT NULL,
+        last_reminded_at TEXT NOT NULL,
+        PRIMARY KEY (ping_id, user_id),
+        FOREIGN KEY (ping_id) REFERENCES resource_ping(id) ON DELETE CASCADE
+    );
+    """,
     "CREATE INDEX IF NOT EXISTS ix_resource_ping_guild ON resource_ping(guild_id);",
     "CREATE INDEX IF NOT EXISTS ix_resource_ping_submission_ping ON resource_ping_submission(ping_id);",
     "CREATE INDEX IF NOT EXISTS ix_resource_ping_submission_user ON resource_ping_submission(user_id);",
     "CREATE INDEX IF NOT EXISTS ix_resource_ping_submission_time ON resource_ping_submission(submitted_at);",
+    "CREATE INDEX IF NOT EXISTS ix_resource_ping_submission_item_ping ON resource_ping_submission_item(ping_id);",
+    "CREATE INDEX IF NOT EXISTS ix_resource_ping_submission_item_user ON resource_ping_submission_item(user_id);",
+    "CREATE INDEX IF NOT EXISTS ix_resource_ping_reminder_time ON resource_ping_reminder(last_reminded_at);",
 ]
+
+
+class PingNotFoundError(Exception):
+    pass
+
+
+class PingInactiveError(Exception):
+    pass
 
 def _table_cols(conn: sqlite3.Connection, table: str) -> set:
     cur = conn.cursor()
@@ -827,6 +868,184 @@ class RefreshPosView(discord.ui.View):
             conn.close()
         await interaction.response.send_modal(RefreshPosModal(self.guild_id, defaults))
 
+
+def get_user_resource_assignments(
+    conn: sqlite3.Connection, guild_id: int, user_id: int
+) -> Dict[str, Dict[str, object]]:
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT
+            pp.planet_id,
+            pp.resource,
+            pp.drills_count,
+            pp.rate,
+            pr.system AS system,
+            pr.planet_name AS planet_name
+        FROM pos_planet pp
+        JOIN pos p ON p.id = pp.pos_id
+        LEFT JOIN planet_resources pr
+          ON (CASE WHEN typeof(pr.planet_id)='integer' AND pr.planet_id>0
+                   THEN pr.planet_id ELSE pr.rowid END) = pp.planet_id
+        WHERE p.guild_id=? AND p.owner_user_id=?
+        ORDER BY LOWER(pp.resource), system, planet_name
+        """,
+        (guild_id, user_id),
+    )
+    rows = cur.fetchall()
+    result: Dict[str, Dict[str, object]] = OrderedDict()
+    for r in rows:
+        name = clean_resource_name(r["resource"])
+        if not name:
+            continue
+        key = name.lower()
+        info = result.get(key)
+        if not info:
+            info = {
+                "name": name,
+                "rate_total": 0.0,
+                "planets": [],
+            }
+            result[key] = info
+        drills = int(r["drills_count"] or 0)
+        rate = float(r["rate"] or 0.0)
+        info["rate_total"] += rate * drills
+        info["planets"].append(
+            {
+                "planet_id": int(r["planet_id"] or 0),
+                "system": r["system"] or "?",
+                "planet": r["planet_name"] or (f"#{int(r['planet_id'])}" if r["planet_id"] is not None else "?"),
+                "drills": drills,
+                "rate": rate,
+            }
+        )
+    return result
+
+
+def get_guild_resource_producers(conn: sqlite3.Connection, guild_id: int) -> List[int]:
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT DISTINCT owner_user_id FROM pos WHERE guild_id=? AND owner_user_id IS NOT NULL",
+        (guild_id,),
+    )
+    return [int(r["owner_user_id"]) for r in cur.fetchall() if r["owner_user_id"] is not None]
+
+
+def record_ping_submission(
+    cur: sqlite3.Cursor, ping_id: int, user_id: int, submitted_at: Optional[str] = None
+) -> Tuple[bool, int, int]:
+    cur.execute("SELECT guild_id, active FROM resource_ping WHERE id=?", (ping_id,))
+    ping_row = cur.fetchone()
+    if not ping_row:
+        raise PingNotFoundError(f"Ping {ping_id} not found")
+    if not bool(ping_row["active"]):
+        raise PingInactiveError(f"Ping {ping_id} is inactive")
+
+    guild_id = int(ping_row["guild_id"])
+    cur.execute(
+        "SELECT submitted_at FROM resource_ping_submission WHERE ping_id=? AND user_id=?",
+        (ping_id, user_id),
+    )
+    already = cur.fetchone() is not None
+    ts = submitted_at or now_utc_iso()
+    cur.execute(
+        """
+        INSERT INTO resource_ping_submission (ping_id, guild_id, user_id, submitted_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(ping_id, user_id) DO UPDATE
+          SET submitted_at=excluded.submitted_at
+        """,
+        (ping_id, guild_id, user_id, ts),
+    )
+    cur.execute(
+        "DELETE FROM resource_ping_reminder WHERE ping_id=? AND user_id=?",
+        (ping_id, user_id),
+    )
+    cur.execute(
+        "SELECT COUNT(*) AS cnt FROM resource_ping_submission WHERE ping_id=?",
+        (ping_id,),
+    )
+    total_row = cur.fetchone()
+    total = int(total_row["cnt"] or 0) if total_row else 0
+    return already, total, guild_id
+
+
+async def update_ping_message_embed(
+    message: Optional[discord.Message], total: int, view: Optional[discord.ui.View] = None
+):
+    if not message:
+        return
+    embeds = list(message.embeds)
+    if not embeds:
+        return
+    embed = discord.Embed.from_dict(embeds[0].to_dict())
+    field_index = None
+    for idx, field in enumerate(embed.fields):
+        if field.name.lower().startswith("отметил"):
+            field_index = idx
+            break
+    value_text = f"**{total}**"
+    if field_index is not None:
+        field_name = embed.fields[field_index].name
+        embed.set_field_at(field_index, name=field_name, value=value_text, inline=False)
+    else:
+        embed.add_field(name="Отметились", value=value_text, inline=False)
+    embed.timestamp = datetime.now(timezone.utc)
+    kwargs = {"embed": embed}
+    if view is not None:
+        kwargs["view"] = view
+    await message.edit(**kwargs)
+
+
+async def update_ping_message_from_db(ping_id: int, total: int):
+    conn = ensure_db_ready()
+    channel_id = None
+    message_id = None
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT channel_id, message_id FROM resource_ping WHERE id=?",
+            (ping_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return
+        channel_id = int(row["channel_id"])
+        message_id = int(row["message_id"])
+    finally:
+        conn.close()
+
+    channel = bot.get_channel(channel_id) if channel_id is not None else None
+    if channel is None and channel_id is not None:
+        try:
+            channel = await bot.fetch_channel(channel_id)
+        except Exception as e:
+            logger.warning(
+                "Не удалось получить канал %s для обновления напоминания %s: %s",
+                channel_id,
+                ping_id,
+                e,
+            )
+            return
+
+    if channel is None or not hasattr(channel, "fetch_message"):
+        return
+
+    try:
+        message = await channel.fetch_message(message_id)
+    except Exception as e:
+        logger.warning(
+            "Не удалось получить сообщение %s в канале %s для напоминания %s: %s",
+            message_id,
+            channel_id,
+            ping_id,
+            e,
+        )
+        return
+
+    await update_ping_message_embed(message, total)
+
+
 class ResourceSubmitButton(discord.ui.Button):
     def __init__(self, ping_id: int):
         super().__init__(
@@ -846,43 +1065,14 @@ class ResourceSubmitButton(discord.ui.Button):
         total = 0
         try:
             cur = conn.cursor()
-            cur.execute(
-                "SELECT guild_id, active FROM resource_ping WHERE id=?",
-                (self.ping_id,),
-            )
-            ping_row = cur.fetchone()
-            if not ping_row:
-                await interaction.followup.send("Напоминание больше не доступно.", ephemeral=True)
-                return
-            if not bool(ping_row["active"]):
-                await interaction.followup.send("Это напоминание уже закрыто.", ephemeral=True)
-                return
-
-            guild_id = int(ping_row["guild_id"])
-            cur.execute(
-                "SELECT submitted_at FROM resource_ping_submission WHERE ping_id=? AND user_id=?",
-                (self.ping_id, interaction.user.id),
-            )
-            row = cur.fetchone()
-            already = row is not None
-
-            cur.execute(
-                """
-                INSERT INTO resource_ping_submission (ping_id, guild_id, user_id, submitted_at)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(ping_id, user_id) DO UPDATE
-                  SET submitted_at=excluded.submitted_at
-                """,
-                (self.ping_id, guild_id, interaction.user.id, now_utc_iso()),
-            )
+            already, total, _guild_id = record_ping_submission(cur, self.ping_id, interaction.user.id)
             conn.commit()
-
-            cur.execute(
-                "SELECT COUNT(*) AS cnt FROM resource_ping_submission WHERE ping_id=?",
-                (self.ping_id,),
-            )
-            count_row = cur.fetchone()
-            total = int(count_row["cnt"] or 0) if count_row else 0
+        except PingNotFoundError:
+            await interaction.followup.send("Напоминание больше не доступно.", ephemeral=True)
+            return
+        except PingInactiveError:
+            await interaction.followup.send("Это напоминание уже закрыто.", ephemeral=True)
+            return
         except Exception as e:
             logger.exception("resource_ping submit error: %s", e)
             await interaction.followup.send(f"Ошибка: {e}", ephemeral=True)
@@ -891,25 +1081,7 @@ class ResourceSubmitButton(discord.ui.Button):
             conn.close()
 
         try:
-            message = interaction.message
-            if message:
-                embeds = list(message.embeds)
-                if embeds:
-                    original = embeds[0]
-                    embed = discord.Embed.from_dict(original.to_dict())
-                    field_index = None
-                    for idx, field in enumerate(embed.fields):
-                        if field.name.lower().startswith("отметил"):
-                            field_index = idx
-                            break
-                    value_text = f"**{total}**"
-                    if field_index is not None:
-                        field_name = embed.fields[field_index].name
-                        embed.set_field_at(field_index, name=field_name, value=value_text, inline=False)
-                    else:
-                        embed.add_field(name="Отметились", value=value_text, inline=False)
-                    embed.timestamp = datetime.now(timezone.utc)
-                    await message.edit(embed=embed, view=self.view)
+            await update_ping_message_embed(interaction.message, total, view=self.view)
         except Exception as e:
             logger.exception("Не удалось обновить сообщение напоминания %s: %s", self.ping_id, e)
 
@@ -1230,6 +1402,187 @@ async def resping_ping(
         ephemeral=True,
     )
 
+
+@resping_group.command(name="submit", description="Отправить список сданных ресурсов по напоминанию.")
+@app_commands.describe(
+    ping_id="ID напоминания о сдаче ресурсов",
+    data="Таблица (TSV/CSV или одной строкой): [ID] Название Количество [Оценка]",
+)
+async def resping_submit(interaction: discord.Interaction, ping_id: int, data: str):
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("Только в сервере.", ephemeral=True)
+        return
+
+    payload = (data or "").strip()
+    if not payload:
+        await interaction.response.send_message("Вставь таблицу в параметр `data`.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    items = parse_have_table(payload)
+    if not items:
+        await interaction.followup.send("Не удалось распарсить данные. Проверь колонки/формат.", ephemeral=True)
+        return
+
+    aggregated: OrderedDict[str, Dict[str, object]] = OrderedDict()
+    invalid_amounts: List[str] = []
+    for name, amount, unit_price in items:
+        resource = clean_resource_name(name)
+        if not resource or amount is None:
+            continue
+        try:
+            amount_val = float(amount)
+        except Exception:
+            continue
+        if amount_val <= 0:
+            invalid_amounts.append(resource)
+            continue
+        key = resource.lower()
+        entry = aggregated.get(key)
+        if not entry:
+            entry = {"name": resource, "amount": 0.0, "prices": []}
+            aggregated[key] = entry
+        entry["amount"] += amount_val
+        if unit_price is not None:
+            try:
+                entry.setdefault("prices", []).append(float(unit_price))
+            except Exception:
+                pass
+
+    if invalid_amounts:
+        pretty = ", ".join(sorted(set(invalid_amounts)))
+        await interaction.followup.send(
+            f"Количество должно быть положительным. Проверь: {pretty}.",
+            ephemeral=True,
+        )
+        return
+
+    if not aggregated:
+        await interaction.followup.send("После фильтрации данных ничего не осталось.", ephemeral=True)
+        return
+
+    for entry in aggregated.values():
+        prices = entry.get("prices", [])
+        entry["unit_price"] = sum(prices) / len(prices) if prices else None
+        entry.pop("prices", None)
+
+    conn = ensure_db_ready()
+    ping_content = ""
+    assignments: Dict[str, Dict[str, object]] = {}
+    already = False
+    total = 0
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT guild_id, content FROM resource_ping WHERE id=?",
+            (ping_id,),
+        )
+        ping_row = cur.fetchone()
+        if not ping_row:
+            raise PingNotFoundError(f"Ping {ping_id} not found")
+        if int(ping_row["guild_id"]) != guild.id:
+            await interaction.followup.send("Этот ID относится к другому серверу.", ephemeral=True)
+            return
+
+        ping_content = ping_row["content"] or ""
+
+        assignments = get_user_resource_assignments(conn, guild.id, interaction.user.id)
+        if not assignments:
+            await interaction.followup.send(
+                "У тебя нет назначенных планет на этом сервере.",
+                ephemeral=True,
+            )
+            return
+
+        unexpected = [entry["name"] for key, entry in aggregated.items() if key not in assignments]
+        if unexpected:
+            available = ", ".join(info["name"] for info in assignments.values()) or "—"
+            await interaction.followup.send(
+                "Эти ресурсы не закреплены за тобой: "
+                + ", ".join(unexpected)
+                + f". Доступные: {available}.",
+                ephemeral=True,
+            )
+            return
+
+        ts = now_utc_iso()
+        cur.execute(
+            "DELETE FROM resource_ping_submission_item WHERE ping_id=? AND user_id=?",
+            (ping_id, interaction.user.id),
+        )
+        for entry in aggregated.values():
+            cur.execute(
+                """
+                INSERT INTO resource_ping_submission_item (
+                    ping_id, guild_id, user_id, resource, amount_units, unit_price, submitted_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(ping_id, user_id, resource) DO UPDATE
+                  SET amount_units=excluded.amount_units,
+                      unit_price=excluded.unit_price,
+                      submitted_at=excluded.submitted_at
+                """,
+                (
+                    ping_id,
+                    guild.id,
+                    interaction.user.id,
+                    entry["name"],
+                    float(entry["amount"]),
+                    float(entry["unit_price"]) if entry["unit_price"] is not None else None,
+                    ts,
+                ),
+            )
+
+        already, total, _ = record_ping_submission(cur, ping_id, interaction.user.id, submitted_at=ts)
+        conn.commit()
+    except PingNotFoundError:
+        await interaction.followup.send("Напоминание не найдено.", ephemeral=True)
+        return
+    except PingInactiveError:
+        await interaction.followup.send("Это напоминание уже закрыто.", ephemeral=True)
+        return
+    except Exception as e:
+        logger.exception("resping_submit error: %s", e)
+        await interaction.followup.send(f"Ошибка: {e}", ephemeral=True)
+        return
+    finally:
+        conn.close()
+
+    try:
+        await update_ping_message_from_db(ping_id, total)
+    except Exception as e:
+        logger.exception("Не удалось обновить сообщение напоминания %s: %s", ping_id, e)
+
+    summary_lines = ["**Отчёт о сдаче ресурсов**"]
+    if ping_content:
+        short = ping_content if len(ping_content) <= 200 else ping_content[:197] + "…"
+        summary_lines.append(f"Напоминание #{ping_id}: {short}")
+
+    for key, entry in aggregated.items():
+        info = assignments.get(key)
+        expected = float(info["rate_total"]) * 24 if info else 0.0
+        diff = entry["amount"] - expected
+        ratio = (entry["amount"] / expected) if expected > 0 else None
+        line = f"- {entry['name']}: **{entry['amount']:,.0f}** ед".replace(",", " ")
+        if expected > 0:
+            line += (
+                f" (≈ {expected:,.0f} за 24ч; Δ {diff:+,.0f} ед"
+            ).replace(",", " ")
+            if ratio is not None:
+                line += f", {ratio*100:.0f}%"
+            line += ")"
+        summary_lines.append(line)
+
+    missing = [info["name"] for key, info in assignments.items() if key not in aggregated]
+    if missing:
+        summary_lines.append("⚠️ В отчёт не попали ресурсы: " + ", ".join(missing))
+
+    summary_lines.append("ℹ️ " + ("Время сдачи обновлено." if already else "Сдача сохранена."))
+
+    await interaction.followup.send("\n".join(summary_lines), ephemeral=True)
+
+
 @resping_group.command(name="stats", description="Показать статистику отметок за период.")
 @app_commands.describe(
     days="Сколько дней учитывать (1-365, по умолчанию 7)",
@@ -1355,6 +1708,175 @@ async def resping_stats(
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 tree.add_command(resping_group)
+
+async def run_resource_reminder_cycle():
+    now = datetime.now(timezone.utc)
+    delay = timedelta(hours=max(0, RES_REMINDER_DELAY_HOURS))
+    due: List[Tuple[int, int, int, str, datetime, Dict[str, Dict[str, object]]]] = []
+
+    conn = ensure_db_ready()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, guild_id, content, created_at FROM resource_ping WHERE active=1",
+        )
+        ping_rows = cur.fetchall()
+        for row in ping_rows:
+            ping_id = int(row["id"])
+            guild_id = int(row["guild_id"])
+            created_raw = row["created_at"]
+            try:
+                created_at = datetime.fromisoformat(created_raw) if created_raw else None
+            except Exception:
+                created_at = None
+            if created_at is None:
+                continue
+            if delay.total_seconds() > 0 and now - created_at < delay:
+                continue
+
+            producers = get_guild_resource_producers(conn, guild_id)
+            if not producers:
+                continue
+
+            for user_id in producers:
+                cur.execute(
+                    "SELECT 1 FROM resource_ping_submission WHERE ping_id=? AND user_id=?",
+                    (ping_id, user_id),
+                )
+                if cur.fetchone():
+                    continue
+
+                cur.execute(
+                    "SELECT last_reminded_at FROM resource_ping_reminder WHERE ping_id=? AND user_id=?",
+                    (ping_id, user_id),
+                )
+                remind_row = cur.fetchone()
+                last_rem: Optional[datetime] = None
+                if remind_row and remind_row["last_reminded_at"]:
+                    try:
+                        last_rem = datetime.fromisoformat(remind_row["last_reminded_at"])
+                    except Exception:
+                        last_rem = None
+                if last_rem and now - last_rem < delay:
+                    continue
+
+                assignments = get_user_resource_assignments(conn, guild_id, user_id)
+                if not assignments:
+                    continue
+
+                due.append((ping_id, guild_id, user_id, row["content"] or "", created_at, assignments))
+    except Exception as e:
+        logger.exception("run_resource_reminder_cycle gather error: %s", e)
+        return
+    finally:
+        conn.close()
+
+    if not due:
+        return
+
+    for ping_id, guild_id, user_id, content, created_at, assignments in due:
+        guild_obj = bot.get_guild(guild_id)
+        guild_name = guild_obj.name if guild_obj else f"ID {guild_id}"
+        user = bot.get_user(user_id)
+        if user is None:
+            try:
+                user = await bot.fetch_user(user_id)
+            except Exception as e:
+                logger.warning(
+                    "Не удалось получить пользователя %s для напоминания %s: %s",
+                    user_id,
+                    ping_id,
+                    e,
+                )
+                user = None
+
+        assignment_lines = []
+        for info in assignments.values():
+            rate_total = float(info.get("rate_total", 0.0))
+            rate_txt = f" ≈ {rate_total:,.0f}/ч".replace(",", " ") if rate_total > 0 else ""
+            assignment_lines.append(f"- {info['name']}{rate_txt}")
+
+        lines = [
+            f"👋 Привет! Напоминание о сдаче ресурсов на сервере **{guild_name}**.",
+            f"Пинг #{ping_id} создан {format_dt(created_at)}.",
+        ]
+        if content:
+            short = content if len(content) <= 200 else content[:197] + "…"
+            lines.append(f"Текст напоминания: {short}")
+        if assignment_lines:
+            lines.append("")
+            lines.append("Твои текущие ресурсы:")
+            lines.extend(assignment_lines)
+        lines.extend(
+            [
+                "",
+                "Если ты уже сдал ресурсы, отметься под сообщением или используй команду",
+                f"`/resping submit ping_id:{ping_id}` на сервере, чтобы отправить отчёт.",
+            ]
+        )
+
+        sent = False
+        if user is not None:
+            try:
+                await user.send("\n".join(lines))
+                sent = True
+                logger.info("Отправлено напоминание пользователю %s по ping %s", user_id, ping_id)
+            except discord.Forbidden:
+                logger.info(
+                    "Не удалось отправить ЛС пользователю %s для напоминания %s: Forbidden",
+                    user_id,
+                    ping_id,
+                )
+            except Exception as e:
+                logger.exception(
+                    "Ошибка при отправке напоминания %s пользователю %s: %s",
+                    ping_id,
+                    user_id,
+                    e,
+                )
+
+        stamp = now_utc_iso()
+        conn_upd = ensure_db_ready()
+        try:
+            cur_upd = conn_upd.cursor()
+            cur_upd.execute(
+                """
+                INSERT INTO resource_ping_reminder (ping_id, user_id, last_reminded_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(ping_id, user_id) DO UPDATE
+                  SET last_reminded_at=excluded.last_reminded_at
+                """,
+                (ping_id, user_id, stamp),
+            )
+            conn_upd.commit()
+        except Exception as e:
+            logger.exception(
+                "Не удалось обновить время напоминания %s/%s: %s",
+                ping_id,
+                user_id,
+                e,
+            )
+        finally:
+            conn_upd.close()
+
+        if not sent:
+            logger.debug(
+                "Напоминание %s пользователю %s не доставлено (см. логи выше)",
+                ping_id,
+                user_id,
+            )
+
+
+async def resource_reminder_loop():
+    await bot.wait_until_ready()
+    interval = max(60, RES_REMINDER_CHECK_SECONDS)
+    while not bot.is_closed():
+        try:
+            await run_resource_reminder_cycle()
+        except Exception as e:
+            logger.exception("resource_reminder_loop error: %s", e)
+        await asyncio.sleep(interval)
+
 
 # ==================== КОМАНДЫ ====================
 @tree.command(name="setneed", description="Задать/обновить целевой ОБЪЁМ (единиц) по ресурсу.")
@@ -2152,6 +2674,11 @@ async def on_ready():
     finally:
         if conn is not None:
             conn.close()
+
+    global reminder_task
+    if reminder_task is None or reminder_task.done():
+        reminder_task = bot.loop.create_task(resource_reminder_loop())
+        logger.info("Цикл напоминаний о сдаче ресурсов запущен.")
 
 def main():
     token = validate_and_clean_token(DISCORD_TOKEN)
