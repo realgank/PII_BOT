@@ -1310,6 +1310,48 @@ async def resping_ping(
         await interaction.response.send_message("Не удалось определить канал для отправки сообщения.", ephemeral=True)
         return
 
+    bot_user = interaction.client.user if interaction.client else None
+    bot_member: Optional[discord.Member] = None
+    if bot_user and guild:
+        bot_member = guild.get_member(bot_user.id)
+        if bot_member is None:
+            try:
+                bot_member = await guild.fetch_member(bot_user.id)
+            except discord.HTTPException:
+                bot_member = None
+
+    if bot_member is None:
+        await interaction.response.send_message(
+            "Не удалось определить права бота на сервере. Проверьте, что бот добавлен на сервер.",
+            ephemeral=True,
+        )
+        return
+
+    channel_permissions = channel.permissions_for(bot_member) if hasattr(channel, "permissions_for") else None
+    missing_permissions: List[str] = []
+    if channel_permissions is None or not channel_permissions.view_channel:
+        missing_permissions.append("просматривать канал")
+    if channel_permissions is None or (
+        isinstance(channel, discord.Thread) and not channel_permissions.send_messages_in_threads
+    ):
+        missing_permissions.append("отправлять сообщения в ветке")
+    elif channel_permissions is not None and not channel_permissions.send_messages:
+        missing_permissions.append("отправлять сообщения")
+    if channel_permissions is not None and not channel_permissions.embed_links:
+        missing_permissions.append("вставлять embed-сообщения")
+    if mention_everyone and (channel_permissions is None or not channel_permissions.mention_everyone):
+        missing_permissions.append("упоминать @everyone")
+    if role is not None and (channel_permissions is None or not channel_permissions.mention_everyone):
+        missing_permissions.append("упоминать роли")
+
+    if missing_permissions:
+        missing_text = ", ".join(sorted(set(missing_permissions)))
+        await interaction.response.send_message(
+            f"⛔ У бота нет необходимых прав для отправки напоминания в этом канале: {missing_text}.",
+            ephemeral=True,
+        )
+        return
+
     body = (text or "").strip()
     if not body:
         await interaction.response.send_message("Текст напоминания не должен быть пустым.", ephemeral=True)
