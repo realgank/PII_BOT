@@ -60,6 +60,17 @@ def format_ts(ts: Optional[str]) -> str:
         return ts
     return format_dt(dt)
 
+def parse_iso_dt(ts: Optional[str]) -> Optional[datetime]:
+    if not ts:
+        return None
+    try:
+        dt = datetime.fromisoformat(ts)
+    except Exception:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
 def clean_resource_name(resource: str) -> str:
     return (resource or "").strip().strip('"').strip("'").strip()
 
@@ -940,6 +951,137 @@ def get_guild_resource_producers(conn: sqlite3.Connection, guild_id: int) -> Lis
         (guild_id,),
     )
     return [int(r["owner_user_id"]) for r in cur.fetchall() if r["owner_user_id"] is not None]
+
+
+def compute_resping_delivery_audit(
+    conn: sqlite3.Connection, guild_id: int, since_iso: str
+) -> Tuple[
+    Dict[int, Dict[str, Dict[str, object]]],
+    Dict[int, int],
+    Dict[int, Dict[str, Dict[str, object]]],
+]:
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT s.user_id, s.ping_id, s.submitted_at
+        FROM resource_ping_submission s
+        JOIN resource_ping p ON p.id = s.ping_id
+        WHERE p.guild_id=? AND s.submitted_at>=?
+        ORDER BY s.user_id, s.submitted_at
+        """,
+        (guild_id, since_iso),
+    )
+    submission_rows = cur.fetchall()
+    if not submission_rows:
+        return {}, {}, {}
+
+    cur.execute(
+        """
+        SELECT s.user_id, MAX(s.submitted_at) AS prev_at
+        FROM resource_ping_submission s
+        JOIN resource_ping p ON p.id = s.ping_id
+        WHERE p.guild_id=? AND s.submitted_at<?
+        GROUP BY s.user_id
+        """,
+        (guild_id, since_iso),
+    )
+    prev_rows = cur.fetchall()
+    prev_map: Dict[int, Optional[datetime]] = {
+        int(r["user_id"]): parse_iso_dt(r["prev_at"])
+        for r in prev_rows
+        if r["prev_at"]
+    }
+
+    cur.execute(
+        """
+        SELECT ping_id, user_id, resource, amount_units, submitted_at
+        FROM resource_ping_submission_item
+        WHERE guild_id=? AND submitted_at>=?
+        """,
+        (guild_id, since_iso),
+    )
+    item_rows = cur.fetchall()
+    items_map: Dict[Tuple[int, int], Dict[str, Dict[str, object]]] = {}
+    for row in item_rows:
+        key = (int(row["ping_id"]), int(row["user_id"]))
+        resource = clean_resource_name(row["resource"])
+        if not resource:
+            continue
+        res_key = resource.lower()
+        entry = items_map.setdefault(key, {})
+        info = entry.get(res_key)
+        if not info:
+            info = {"name": resource, "amount": 0.0}
+            entry[res_key] = info
+        info["amount"] += float(row["amount_units"] or 0.0)
+
+    stats: Dict[int, Dict[str, Dict[str, object]]] = {}
+    intervals: Dict[int, int] = {}
+    extras: Dict[int, Dict[str, Dict[str, object]]] = {}
+    assignment_cache: Dict[int, Dict[str, Dict[str, object]]] = {}
+
+    for row in submission_rows:
+        user_id = int(row["user_id"])
+        ping_id = int(row["ping_id"])
+        submitted_at = parse_iso_dt(row["submitted_at"])
+        if submitted_at is None:
+            continue
+        prev_ts = prev_map.get(user_id)
+        assignments = assignment_cache.get(user_id)
+        if assignments is None:
+            assignments = get_user_resource_assignments(conn, guild_id, user_id)
+            assignment_cache[user_id] = assignments
+        if not assignments:
+            prev_map[user_id] = submitted_at
+            continue
+        if prev_ts is None:
+            prev_map[user_id] = submitted_at
+            continue
+
+        delta = submitted_at - prev_ts
+        hours = delta.total_seconds() / 3600.0
+        if hours <= 0:
+            prev_map[user_id] = submitted_at
+            continue
+
+        stats_user = stats.setdefault(user_id, {})
+        intervals[user_id] = intervals.get(user_id, 0) + 1
+
+        submission_items = items_map.get((ping_id, user_id), {})
+
+        for key, info in assignments.items():
+            expected = float(info.get("rate_total") or 0.0) * hours
+            if expected <= 0:
+                continue
+            res_entry = stats_user.setdefault(
+                key,
+                {
+                    "name": info.get("name") or key,
+                    "expected": 0.0,
+                    "actual": 0.0,
+                    "intervals": 0,
+                },
+            )
+            res_entry["expected"] += expected
+            item_info = submission_items.get(key)
+            if item_info:
+                res_entry["actual"] += float(item_info.get("amount") or 0.0)
+            res_entry["intervals"] += 1
+
+        if submission_items:
+            extra_map = extras.setdefault(user_id, {})
+            for key, info in submission_items.items():
+                if key in assignments:
+                    continue
+                extra_entry = extra_map.get(key)
+                if not extra_entry:
+                    extra_entry = {"name": info.get("name") or key, "amount": 0.0}
+                    extra_map[key] = extra_entry
+                extra_entry["amount"] += float(info.get("amount") or 0.0)
+
+        prev_map[user_id] = submitted_at
+
+    return stats, intervals, extras
 
 
 def _compute_ping_submission_totals(
@@ -2129,6 +2271,156 @@ async def resping_stats(
         embed.add_field(name="Напоминания", value="\n".join(ping_lines), inline=False)
 
     await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@resping_group.command(name="audit", description="Анализ сдачи ресурсов между отметками.")
+@app_commands.describe(
+    days="Сколько дней учитывать (1-90, по умолчанию 7)",
+    tolerance="Допустимая погрешность в процентах (0-100, по умолчанию 15)",
+)
+async def resping_audit(
+    interaction: discord.Interaction,
+    days: Optional[int] = 7,
+    tolerance: Optional[float] = 15,
+):
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("Только в сервере.", ephemeral=True)
+        return
+    if not is_admin_user(interaction):
+        await interaction.response.send_message(
+            "⛔ Команда доступна только администраторам сервера.", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    days_val = int(days or 7)
+    if days_val < 1:
+        days_val = 1
+    if days_val > 90:
+        days_val = 90
+
+    tol_val = float(tolerance if tolerance is not None else 15.0)
+    if tol_val < 0:
+        tol_val = 0.0
+    if tol_val > 100:
+        tol_val = 100.0
+    tol_fraction = tol_val / 100.0
+
+    now_dt = datetime.now(timezone.utc)
+    since_dt = now_dt - timedelta(days=days_val)
+    since_iso = since_dt.replace(microsecond=0).isoformat()
+
+    conn = ensure_db_ready()
+    try:
+        stats, intervals, extras = compute_resping_delivery_audit(conn, guild.id, since_iso)
+    except Exception as e:
+        logger.exception("resping_audit error: %s", e)
+        await interaction.followup.send(f"Ошибка: {e}", ephemeral=True)
+        return
+    finally:
+        conn.close()
+
+    if not stats:
+        await interaction.followup.send(
+            "Нет данных о сдаче ресурсов за выбранный период.", ephemeral=True
+        )
+        return
+
+    user_entries = []
+    for user_id, resources in stats.items():
+        total_expected = sum(float(info.get("expected") or 0.0) for info in resources.values())
+        if total_expected <= 0:
+            continue
+        total_actual = sum(float(info.get("actual") or 0.0) for info in resources.values())
+        ratio = (total_actual / total_expected) if total_expected > 0 else 0.0
+        user_entries.append((ratio, user_id, resources))
+
+    if not user_entries:
+        await interaction.followup.send(
+            "Недостаточно данных о сдаче ресурсов за выбранный период.", ephemeral=True
+        )
+        return
+
+    user_entries.sort(key=lambda item: item[0])
+
+    lines: List[str] = [
+        "**Аудит сдачи ресурсов**",
+        f"Период: {format_dt(since_dt)} — {format_dt(now_dt)}",
+        f"Допустимая погрешность: ±{tol_val:.0f}%",
+        "Рассчитано по интервалам между отметками \"Сдал\" (кнопка или /resping submit).",
+        "",
+    ]
+
+    for ratio, user_id, resources in user_entries:
+        member = guild.get_member(user_id)
+        if member:
+            user_name = f"{member.display_name} ({member.mention})"
+        else:
+            user_name = f"<@{user_id}>"
+
+        total_expected = sum(float(info.get("expected") or 0.0) for info in resources.values())
+        total_actual = sum(float(info.get("actual") or 0.0) for info in resources.values())
+        total_ratio = (total_actual / total_expected) if total_expected > 0 else 0.0
+        total_delta = total_actual - total_expected
+        intervals_count = intervals.get(user_id, 0)
+
+        header = (
+            f"{user_name} — интервалов: {intervals_count}, всего {total_actual:,.0f}/{total_expected:,.0f} ед"
+            f" ({total_ratio*100:.0f}%, Δ {total_delta:+,.0f})"
+        ).replace(",", " ")
+        lines.append(header)
+
+        resource_entries = list(resources.values())
+        resource_entries.sort(
+            key=lambda info: (
+                (float(info.get("actual") or 0.0) / float(info.get("expected") or 1.0))
+                if float(info.get("expected") or 0.0) > 0
+                else 1.0
+            )
+        )
+
+        for entry in resource_entries:
+            expected = float(entry.get("expected") or 0.0)
+            if expected <= 0:
+                continue
+            actual = float(entry.get("actual") or 0.0)
+            delta = actual - expected
+            ratio_val = (actual / expected) if expected > 0 else 0.0
+            if actual <= 0:
+                status = "❌"
+            elif ratio_val < (1 - tol_fraction):
+                status = "⚠️"
+            else:
+                status = "✅"
+            line = (
+                f"  {status} {entry.get('name')}: {actual:,.0f}/{expected:,.0f} ед"
+                f" ({ratio_val*100:.0f}%, Δ {delta:+,.0f})"
+            ).replace(",", " ")
+            lines.append(line)
+
+        extra_map = extras.get(user_id, {})
+        if extra_map:
+            extra_parts = []
+            for info in extra_map.values():
+                amount = float(info.get("amount") or 0.0)
+                if amount <= 0:
+                    continue
+                extra_parts.append(f"{info.get('name')}: {amount:,.0f} ед".replace(",", " "))
+            if extra_parts:
+                lines.append("  ➕ Дополнительно (не из назначенных): " + ", ".join(extra_parts))
+
+        lines.append("")
+
+    text = "\n".join(lines).strip()
+    await send_long(
+        interaction,
+        text,
+        ephemeral=True,
+        title="Аудит сдачи ресурсов",
+    )
+
 
 tree.add_command(resping_group)
 
