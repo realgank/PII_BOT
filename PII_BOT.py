@@ -12,6 +12,7 @@ from collections import OrderedDict
 
 import discord
 from discord import app_commands
+from discord.abc import Snowflake
 
 # ==================== НАСТРОЙКИ (без config.json) ====================
 DB_PATH = os.getenv("DB_PATH", "planets.db")
@@ -1312,37 +1313,60 @@ async def resping_ping(
 
     bot_user = interaction.client.user if interaction.client else None
     bot_member: Optional[discord.Member] = None
-    if bot_user and guild:
-        bot_member = guild.get_member(bot_user.id)
-        if bot_member is None:
-            try:
-                bot_member = await guild.fetch_member(bot_user.id)
-            except discord.HTTPException:
-                bot_member = None
+    if guild:
+        possible_member = getattr(guild, "me", None)
+        if isinstance(possible_member, discord.Member):
+            bot_member = possible_member
+        elif bot_user:
+            bot_member = guild.get_member(bot_user.id)
 
-    if bot_member is None:
+    if bot_member is None and bot_user and guild:
+        try:
+            bot_member = await guild.fetch_member(bot_user.id)
+        except discord.HTTPException as exc:
+            logger.warning(
+                "resping_ping: failed to fetch bot member in guild %s (%s): %s", guild.id, guild.name, exc
+            )
+            bot_member = None
+
+    fallback_identity: Optional[Snowflake] = None
+    if bot_member is not None:
+        fallback_identity = bot_member
+    elif bot_user is not None:
+        fallback_identity = discord.Object(id=bot_user.id)
+
+    if fallback_identity is None:
         await interaction.response.send_message(
             "Не удалось определить права бота на сервере. Проверьте, что бот добавлен на сервер.",
             ephemeral=True,
         )
         return
 
-    channel_permissions = channel.permissions_for(bot_member) if hasattr(channel, "permissions_for") else None
+    channel_permissions: Optional[discord.Permissions] = None
+    if isinstance(bot_member, discord.Member) and hasattr(channel, "permissions_for"):
+        channel_permissions = channel.permissions_for(bot_member)
+    else:
+        logger.warning(
+            "resping_ping: не удалось определить права бота (guild_id=%s, channel_id=%s), пропускаю предварительную проверку.",
+            getattr(guild, "id", "?"),
+            getattr(channel, "id", "?"),
+        )
+
     missing_permissions: List[str] = []
-    if channel_permissions is None or not channel_permissions.view_channel:
-        missing_permissions.append("просматривать канал")
-    if channel_permissions is None or (
-        isinstance(channel, discord.Thread) and not channel_permissions.send_messages_in_threads
-    ):
-        missing_permissions.append("отправлять сообщения в ветке")
-    elif channel_permissions is not None and not channel_permissions.send_messages:
-        missing_permissions.append("отправлять сообщения")
-    if channel_permissions is not None and not channel_permissions.embed_links:
-        missing_permissions.append("вставлять embed-сообщения")
-    if mention_everyone and (channel_permissions is None or not channel_permissions.mention_everyone):
-        missing_permissions.append("упоминать @everyone")
-    if role is not None and (channel_permissions is None or not channel_permissions.mention_everyone):
-        missing_permissions.append("упоминать роли")
+    if channel_permissions is not None:
+        if not channel_permissions.view_channel:
+            missing_permissions.append("просматривать канал")
+        if isinstance(channel, discord.Thread):
+            if not channel_permissions.send_messages_in_threads:
+                missing_permissions.append("отправлять сообщения в ветке")
+        elif not channel_permissions.send_messages:
+            missing_permissions.append("отправлять сообщения")
+        if not channel_permissions.embed_links:
+            missing_permissions.append("вставлять embed-сообщения")
+        if mention_everyone and not channel_permissions.mention_everyone:
+            missing_permissions.append("упоминать @everyone")
+        if role is not None and not channel_permissions.mention_everyone:
+            missing_permissions.append("упоминать роли")
 
     if missing_permissions:
         missing_text = ", ".join(sorted(set(missing_permissions)))
