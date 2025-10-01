@@ -4,7 +4,7 @@ import logging
 import sqlite3
 import pathlib
 import asyncio
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 from datetime import datetime, timezone, timedelta
 import re
 import base64
@@ -251,6 +251,16 @@ DDL = [
         ping_id          INTEGER NOT NULL,
         user_id          INTEGER NOT NULL,
         last_reminded_at TEXT NOT NULL,
+        PRIMARY KEY (ping_id, user_id),
+        FOREIGN KEY (ping_id) REFERENCES resource_ping(id) ON DELETE CASCADE
+    );
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS resource_ping_thread (
+        ping_id    INTEGER NOT NULL,
+        user_id    INTEGER NOT NULL,
+        thread_id  INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
         PRIMARY KEY (ping_id, user_id),
         FOREIGN KEY (ping_id) REFERENCES resource_ping(id) ON DELETE CASCADE
     );
@@ -971,6 +981,152 @@ def record_ping_submission(
     return already, total, guild_id
 
 
+def get_ping_thread_id(conn: sqlite3.Connection, ping_id: int, user_id: int) -> Optional[int]:
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT thread_id FROM resource_ping_thread WHERE ping_id=? AND user_id=?",
+        (ping_id, user_id),
+    )
+    row = cur.fetchone()
+    return int(row["thread_id"]) if row and row["thread_id"] is not None else None
+
+
+def upsert_ping_thread(conn: sqlite3.Connection, ping_id: int, user_id: int, thread_id: int) -> None:
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO resource_ping_thread (ping_id, user_id, thread_id, created_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(ping_id, user_id) DO UPDATE
+          SET thread_id=excluded.thread_id,
+              created_at=excluded.created_at
+        """,
+        (ping_id, user_id, thread_id, now_utc_iso()),
+    )
+
+
+def delete_ping_thread(conn: sqlite3.Connection, ping_id: int, user_id: int) -> None:
+    cur = conn.cursor()
+    cur.execute(
+        "DELETE FROM resource_ping_thread WHERE ping_id=? AND user_id=?",
+        (ping_id, user_id),
+    )
+
+
+async def resolve_thread(thread_id: int) -> Optional[discord.Thread]:
+    channel = bot.get_channel(thread_id)
+    if isinstance(channel, discord.Thread):
+        return channel
+    try:
+        fetched = await bot.fetch_channel(thread_id)
+    except discord.NotFound:
+        return None
+    except discord.Forbidden:
+        logger.warning("Нет доступа к ветке %s", thread_id)
+        return None
+    except Exception as e:
+        logger.exception("Ошибка при получении ветки %s: %s", thread_id, e)
+        return None
+    return fetched if isinstance(fetched, discord.Thread) else None
+
+
+async def get_or_create_ping_thread(
+    ping_id: int,
+    user_id: int,
+    message: discord.Message,
+    user: Optional[Union[discord.Member, discord.User]],
+) -> Tuple[Optional[discord.Thread], bool]:
+    conn = ensure_db_ready()
+    try:
+        existing_id = get_ping_thread_id(conn, ping_id, user_id)
+    finally:
+        conn.close()
+
+    if existing_id:
+        thread = await resolve_thread(existing_id)
+        if thread is not None:
+            if getattr(thread, "archived", False):
+                try:
+                    await thread.edit(archived=False)
+                except Exception as e:
+                    logger.warning("Не удалось разархивировать ветку %s: %s", thread.id, e)
+            return thread, False
+
+    display_name = None
+    if user is not None:
+        display_name = getattr(user, "display_name", None) or getattr(user, "name", None)
+    if not display_name:
+        display_name = f"User {user_id}"
+    base_name = f"Сдача • {display_name}"
+    thread_name = base_name[:95]
+
+    try:
+        thread = await message.create_thread(
+            name=thread_name,
+            auto_archive_duration=1440,
+        )
+    except discord.HTTPException as e:
+        logger.warning("Не удалось создать ветку для ping %s и пользователя %s: %s", ping_id, user_id, e)
+        return None, False
+    except Exception as e:
+        logger.exception("Ошибка при создании ветки для ping %s и пользователя %s: %s", ping_id, user_id, e)
+        return None, False
+
+    conn = ensure_db_ready()
+    try:
+        upsert_ping_thread(conn, ping_id, user_id, int(thread.id))
+        conn.commit()
+    finally:
+        conn.close()
+
+    return thread, True
+
+
+async def close_ping_thread(ping_id: int, user_id: int, reason: Optional[str] = None) -> None:
+    conn = ensure_db_ready()
+    try:
+        thread_id = get_ping_thread_id(conn, ping_id, user_id)
+    finally:
+        conn.close()
+
+    if not thread_id:
+        return
+
+    thread = await resolve_thread(thread_id)
+    delete_reason = reason or "Resource submission received"
+    if thread is not None:
+        try:
+            await thread.delete(reason=delete_reason)
+        except discord.Forbidden:
+            try:
+                await thread.edit(archived=True, locked=True, reason=delete_reason)
+            except Exception as e:
+                logger.warning(
+                    "Не удалось удалить или заархивировать ветку %s для ping %s/%s: %s",
+                    thread_id,
+                    ping_id,
+                    user_id,
+                    e,
+                )
+        except discord.NotFound:
+            pass
+        except Exception as e:
+            logger.exception(
+                "Ошибка при удалении ветки %s для ping %s/%s: %s",
+                thread_id,
+                ping_id,
+                user_id,
+                e,
+            )
+
+    conn = ensure_db_ready()
+    try:
+        delete_ping_thread(conn, ping_id, user_id)
+        conn.commit()
+    finally:
+        conn.close()
+
+
 async def update_ping_message_embed(
     message: Optional[discord.Message], total: int, view: Optional[discord.ui.View] = None
 ):
@@ -1085,6 +1241,20 @@ class ResourceSubmitButton(discord.ui.Button):
             await update_ping_message_embed(interaction.message, total, view=self.view)
         except Exception as e:
             logger.exception("Не удалось обновить сообщение напоминания %s: %s", self.ping_id, e)
+
+        try:
+            await close_ping_thread(
+                self.ping_id,
+                interaction.user.id,
+                reason="Пользователь отметил сдачу через кнопку",
+            )
+        except Exception as e:
+            logger.exception(
+                "Не удалось закрыть ветку для ping %s пользователя %s: %s",
+                self.ping_id,
+                interaction.user.id,
+                e,
+            )
 
         info = "ℹ️ Ты уже отмечался, время обновлено." if already else "✅ Отметил сдачу. Спасибо!"
         await interaction.followup.send(info, ephemeral=True)
@@ -1620,6 +1790,20 @@ async def resping_submit(interaction: discord.Interaction, ping_id: int, data: s
     except Exception as e:
         logger.exception("Не удалось обновить сообщение напоминания %s: %s", ping_id, e)
 
+    try:
+        await close_ping_thread(
+            ping_id,
+            interaction.user.id,
+            reason="Пользователь загрузил отчёт через /resping submit",
+        )
+    except Exception as e:
+        logger.exception(
+            "Не удалось закрыть ветку для ping %s пользователя %s после submit: %s",
+            ping_id,
+            interaction.user.id,
+            e,
+        )
+
     summary_lines = ["**Отчёт о сдаче ресурсов**"]
     if ping_content:
         short = ping_content if len(ping_content) <= 200 else ping_content[:197] + "…"
@@ -1778,18 +1962,26 @@ tree.add_command(resping_group)
 async def run_resource_reminder_cycle():
     now = datetime.now(timezone.utc)
     delay = timedelta(hours=max(0, RES_REMINDER_DELAY_HOURS))
-    due: List[Tuple[int, int, int, str, datetime, Dict[str, Dict[str, object]]]] = []
+    due: List[
+        Tuple[int, int, int, int, int, str, datetime, Dict[str, Dict[str, object]]]
+    ] = []
 
     conn = ensure_db_ready()
     try:
         cur = conn.cursor()
         cur.execute(
-            "SELECT id, guild_id, content, created_at FROM resource_ping WHERE active=1",
+            """
+            SELECT id, guild_id, channel_id, message_id, content, created_at
+            FROM resource_ping
+            WHERE active=1
+            """,
         )
         ping_rows = cur.fetchall()
         for row in ping_rows:
             ping_id = int(row["id"])
             guild_id = int(row["guild_id"])
+            channel_id = int(row["channel_id"])
+            message_id = int(row["message_id"])
             created_raw = row["created_at"]
             try:
                 created_at = datetime.fromisoformat(created_raw) if created_raw else None
@@ -1830,7 +2022,18 @@ async def run_resource_reminder_cycle():
                 if not assignments:
                     continue
 
-                due.append((ping_id, guild_id, user_id, row["content"] or "", created_at, assignments))
+                due.append(
+                    (
+                        ping_id,
+                        guild_id,
+                        channel_id,
+                        message_id,
+                        user_id,
+                        row["content"] or "",
+                        created_at,
+                        assignments,
+                    )
+                )
     except Exception as e:
         logger.exception("run_resource_reminder_cycle gather error: %s", e)
         return
@@ -1840,7 +2043,16 @@ async def run_resource_reminder_cycle():
     if not due:
         return
 
-    for ping_id, guild_id, user_id, content, created_at, assignments in due:
+    for (
+        ping_id,
+        guild_id,
+        channel_id,
+        message_id,
+        user_id,
+        content,
+        created_at,
+        assignments,
+    ) in due:
         guild_obj = bot.get_guild(guild_id)
         guild_name = guild_obj.name if guild_obj else f"ID {guild_id}"
         user = bot.get_user(user_id)
@@ -1856,14 +2068,47 @@ async def run_resource_reminder_cycle():
                 )
                 user = None
 
+        channel = bot.get_channel(channel_id)
+        if channel is None:
+            try:
+                channel = await bot.fetch_channel(channel_id)
+            except Exception as e:
+                logger.warning(
+                    "Не удалось получить канал %s для напоминания %s: %s",
+                    channel_id,
+                    ping_id,
+                    e,
+                )
+                channel = None
+        if channel is None or not hasattr(channel, "fetch_message"):
+            logger.warning(
+                "Канал %s для напоминания %s недоступен или не поддерживает fetch_message",
+                channel_id,
+                ping_id,
+            )
+            continue
+
+        try:
+            message = await channel.fetch_message(message_id)
+        except Exception as e:
+            logger.warning(
+                "Не удалось получить сообщение %s в канале %s для напоминания %s: %s",
+                message_id,
+                channel_id,
+                ping_id,
+                e,
+            )
+            continue
+
         assignment_lines = []
         for info in assignments.values():
             rate_total = float(info.get("rate_total", 0.0))
             rate_txt = f" ≈ {rate_total:,.0f}/ч".replace(",", " ") if rate_total > 0 else ""
             assignment_lines.append(f"- {info['name']}{rate_txt}")
 
+        mention_text = getattr(user, "mention", None) or f"<@{user_id}>"
         lines = [
-            f"👋 Привет! Напоминание о сдаче ресурсов на сервере **{guild_name}**.",
+            f"{mention_text}, напоминание о сдаче ресурсов на сервере **{guild_name}**.",
             f"Пинг #{ping_id} создан {format_dt(created_at)}.",
         ]
         if content:
@@ -1876,27 +2121,36 @@ async def run_resource_reminder_cycle():
         lines.extend(
             [
                 "",
-                "Если ты уже сдал ресурсы, отметься под сообщением или используй команду",
-                f"`/resping submit ping_id:{ping_id}` на сервере, чтобы отправить отчёт.",
+                "Отправь отчёт об отгрузке прямо в этой ветке и отметься под основным сообщением.",
+                f"Можно также использовать команду `/resping submit ping_id:{ping_id}` на сервере.",
+                "После отметки ветка будет удалена автоматически.",
             ]
         )
 
+        thread, created = await get_or_create_ping_thread(ping_id, user_id, message, user)
         sent = False
-        if user is not None:
+        if thread is not None:
             try:
-                await user.send("\n".join(lines))
+                await thread.send("\n".join(lines))
                 sent = True
-                logger.info("Отправлено напоминание пользователю %s по ping %s", user_id, ping_id)
+                logger.info(
+                    "Отправлено напоминание пользователю %s по ping %s в ветке %s (created=%s)",
+                    user_id,
+                    ping_id,
+                    thread.id,
+                    created,
+                )
             except discord.Forbidden:
                 logger.info(
-                    "Не удалось отправить ЛС пользователю %s для напоминания %s: Forbidden",
-                    user_id,
+                    "Нет прав на отправку сообщений в ветку %s для напоминания %s",
+                    getattr(thread, "id", "?"),
                     ping_id,
                 )
             except Exception as e:
                 logger.exception(
-                    "Ошибка при отправке напоминания %s пользователю %s: %s",
+                    "Ошибка при отправке напоминания %s в ветку %s пользователю %s: %s",
                     ping_id,
+                    getattr(thread, "id", "?"),
                     user_id,
                     e,
                 )
@@ -1927,7 +2181,7 @@ async def run_resource_reminder_cycle():
 
         if not sent:
             logger.debug(
-                "Напоминание %s пользователю %s не доставлено (см. логи выше)",
+                "Напоминание %s пользователю %s не доставлено в ветку (см. логи выше)",
                 ping_id,
                 user_id,
             )
