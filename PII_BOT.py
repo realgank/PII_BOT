@@ -2281,7 +2281,7 @@ async def resping_stats(
 async def resping_audit(
     interaction: discord.Interaction,
     days: Optional[int] = 7,
-    tolerance: Optional[float] = 15,
+    tolerance: Optional[float] = 15.0,
 ):
     guild = interaction.guild
     if not guild:
