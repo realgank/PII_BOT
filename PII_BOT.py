@@ -1633,10 +1633,80 @@ async def resping_ping(
     finally:
         conn.close()
 
-    await interaction.followup.send(
-        f"✅ Напоминание #{ping_id} создано. {message.jump_url}",
-        ephemeral=True,
-    )
+    conn_notify = ensure_db_ready()
+    try:
+        targets = get_guild_resource_producers(conn_notify, guild.id)
+        user_payloads: List[Tuple[int, Dict[str, Dict[str, object]]]] = []
+        for user_id in targets:
+            try:
+                assignments = get_user_resource_assignments(conn_notify, guild.id, user_id)
+            except Exception:
+                assignments = {}
+            user_payloads.append((user_id, assignments))
+    finally:
+        conn_notify.close()
+
+    notified = 0
+    failed: List[int] = []
+    for user_id, assignments in user_payloads:
+        user = interaction.client.get_user(user_id) if interaction.client else None
+        if user is None:
+            try:
+                user = await interaction.client.fetch_user(user_id) if interaction.client else None
+            except Exception as exc:
+                logger.warning("Не удалось получить пользователя %s: %s", user_id, exc)
+                user = None
+        if user is None:
+            failed.append(user_id)
+            continue
+
+        assignment_lines: List[str] = []
+        for info in assignments.values():
+            rate_total = float(info.get("rate_total", 0.0))
+            rate_txt = f" ≈ {rate_total:,.0f}/ч".replace(",", " ") if rate_total > 0 else ""
+            assignment_lines.append(f"- {info['name']}{rate_txt}")
+
+        lines = [
+            f"👋 Привет! Администратор сервера **{guild.name}** создал напоминание о сдаче ресурсов.",
+            f"ID напоминания: #{ping_id}.",
+        ]
+        if body:
+            short = body if len(body) <= 200 else body[:197] + "…"
+            lines.append(f"Текст: {short}")
+        lines.append("")
+        if assignment_lines:
+            lines.append("Твои ресурсы:")
+            lines.extend(assignment_lines)
+        else:
+            lines.append("Тебе пока не назначены ресурсы — отметь сдачу при их наличии.")
+        lines.extend(
+            [
+                "",
+                "Нажми кнопку ниже, чтобы отметить сдачу.",
+                f"Можно также использовать команду `/resping submit ping_id:{ping_id}` на сервере.",
+            ]
+        )
+
+        try:
+            await user.send("\n".join(lines), view=ResourcePingView(ping_id))
+            notified += 1
+        except discord.Forbidden:
+            failed.append(user_id)
+        except Exception as exc:
+            logger.exception("Не удалось отправить DM пользователю %s: %s", user_id, exc)
+            failed.append(user_id)
+
+    summary_lines = [f"✅ Напоминание #{ping_id} создано. {message.jump_url}"]
+    total_targets = len(user_payloads)
+    if total_targets:
+        summary_lines.append(
+            f"DM отправлено: **{notified}** из **{total_targets}**."
+        )
+    if failed:
+        failed_mentions = ", ".join(f"<@{uid}>" for uid in failed)
+        summary_lines.append("Не удалось отправить DM: " + failed_mentions)
+
+    await interaction.followup.send("\n".join(summary_lines), ephemeral=True)
 
 
 @resping_group.command(name="submit", description="Отправить список сданных ресурсов по напоминанию.")
