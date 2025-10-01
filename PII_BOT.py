@@ -216,6 +216,7 @@ DDL = [
         message_id     INTEGER NOT NULL,
         author_user_id INTEGER NOT NULL,
         content        TEXT,
+        pos_id         INTEGER,
         role_id        INTEGER,
         created_at     TEXT NOT NULL,
         active         INTEGER NOT NULL DEFAULT 1
@@ -369,6 +370,9 @@ def ensure_schema(conn: sqlite3.Connection):
             cur.execute("ALTER TABLE pos_planet_new RENAME TO pos_planet")
         finally:
             cur.execute("PRAGMA foreign_keys=ON")
+
+    # resource_ping: привязка к POS
+    _add_col_if_missing("resource_ping", "pos_id INTEGER")
 
     # guild_have/isk_price/guild_needs_row: гарантируем updated_at
     _add_col_if_missing("guild_have", "unit_price REAL")
@@ -881,7 +885,10 @@ class RefreshPosView(discord.ui.View):
 
 
 def get_user_resource_assignments(
-    conn: sqlite3.Connection, guild_id: int, user_id: int
+    conn: sqlite3.Connection,
+    guild_id: int,
+    user_id: int,
+    pos_id: Optional[int] = None,
 ) -> Dict[str, Dict[str, object]]:
     cur = conn.cursor()
     cur.execute(
@@ -899,9 +906,10 @@ def get_user_resource_assignments(
           ON (CASE WHEN typeof(pr.planet_id)='integer' AND pr.planet_id>0
                    THEN pr.planet_id ELSE pr.rowid END) = pp.planet_id
         WHERE p.guild_id=? AND p.owner_user_id=?
+          AND (? IS NULL OR p.id=?)
         ORDER BY LOWER(pp.resource), system, planet_name
         """,
-        (guild_id, user_id),
+        (guild_id, user_id, pos_id, pos_id),
     )
     rows = cur.fetchall()
     result: Dict[str, Dict[str, object]] = OrderedDict()
@@ -1295,6 +1303,121 @@ async def system_autocomplete(interaction: discord.Interaction, current: str) ->
         items = [s for s in items if q in s.lower()]
     return [app_commands.Choice(name=s, value=s) for s in items[:25]]
 
+# --- автодополнение POS ---
+def _query_pos_names(conn: sqlite3.Connection, guild_id: int, owner_user_id: Optional[int] = None) -> List[str]:
+    cur = conn.cursor()
+    params: List[Union[int, str]] = [guild_id]
+    sql = "SELECT name FROM pos WHERE guild_id=?"
+    if owner_user_id is not None:
+        sql += " AND owner_user_id=?"
+        params.append(owner_user_id)
+    sql += " ORDER BY LOWER(name), name"
+    cur.execute(sql, params)
+    seen: Dict[str, str] = OrderedDict()
+    for row in cur.fetchall():
+        name = (row["name"] or "").strip()
+        if not name:
+            continue
+        key = name.lower()
+        if key not in seen:
+            seen[key] = name
+    return list(seen.values())
+
+
+def _build_pos_name_choices(names: List[str], current: str) -> List[app_commands.Choice[str]]:
+    q = (current or "").lower()
+    filtered = [n for n in names if not q or q in n.lower()]
+    return [app_commands.Choice(name=n, value=n) for n in filtered[:25]]
+
+
+async def guild_pos_name_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+    guild = interaction.guild
+    if not guild:
+        return []
+    conn = ensure_db_ready()
+    try:
+        names = _query_pos_names(conn, guild.id)
+    finally:
+        conn.close()
+    return _build_pos_name_choices(names, current)
+
+
+async def user_pos_name_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+    guild = interaction.guild
+    if not guild:
+        return []
+    conn = ensure_db_ready()
+    try:
+        names = _query_pos_names(conn, guild.id, interaction.user.id)
+    finally:
+        conn.close()
+    return _build_pos_name_choices(names, current)
+
+
+async def resping_submit_autocomplete(
+    interaction: discord.Interaction,
+    current: str,
+) -> List[app_commands.Choice[str]]:
+    guild = interaction.guild
+    if not guild:
+        return []
+
+    conn = ensure_db_ready()
+    try:
+        cur = conn.cursor()
+        params: List[Union[int, str]] = [guild.id]
+        query = (
+            "SELECT rp.id AS ping_id, p.name AS pos_name "
+            "FROM resource_ping rp "
+            "JOIN pos p ON p.id = rp.pos_id "
+            "WHERE rp.guild_id=? AND rp.active=1"
+        )
+        if not is_admin_user(interaction):
+            query += " AND p.owner_user_id=?"
+            params.append(interaction.user.id)
+        query += " ORDER BY rp.created_at DESC, rp.id DESC"
+        cur.execute(query, params)
+        rows = cur.fetchall()
+
+        choices: List[app_commands.Choice[str]] = []
+        q = (current or "").lower()
+        for row in rows:
+            name = row["pos_name"] or ""
+            if q and q not in name.lower():
+                continue
+            label = f"{name} (#{int(row['ping_id'])})"
+            choices.append(app_commands.Choice(name=label, value=str(int(row["ping_id"]))))
+            if len(choices) >= 25:
+                break
+
+        if len(choices) < 25:
+            cur.execute(
+                """
+                SELECT id AS ping_id, content
+                FROM resource_ping
+                WHERE guild_id=? AND active=1 AND pos_id IS NULL
+                ORDER BY created_at DESC, id DESC
+                """,
+                (guild.id,),
+            )
+            for row in cur.fetchall():
+                content = (row["content"] or "").strip()
+                normalized = " ".join(content.split())
+                if not normalized:
+                    normalized = f"Напоминание #{int(row['ping_id'])}"
+                if len(normalized) > 80:
+                    normalized = normalized[:77] + "…"
+                if q and q not in normalized.lower():
+                    continue
+                label = f"{normalized} (#{int(row['ping_id'])})"
+                choices.append(app_commands.Choice(name=label, value=str(int(row["ping_id"]))))
+                if len(choices) >= 25:
+                    break
+    finally:
+        conn.close()
+
+    return choices
+
 # --- автодополнение ресурсов (объединённое) ---
 def resource_autocomplete_choices(conn: sqlite3.Connection, guild_id: Optional[int] = None) -> List[str]:
     cur = conn.cursor()
@@ -1462,12 +1585,15 @@ resping_group = app_commands.Group(
     text="Текст напоминания",
     role="Роль для упоминания (опционально)",
     mention_everyone="Упомянуть @everyone вместе с сообщением",
+    pos_name="Привязать напоминание к POS (опционально)",
 )
+@app_commands.autocomplete(pos_name=guild_pos_name_autocomplete)
 async def resping_ping(
     interaction: discord.Interaction,
     text: str,
     role: Optional[discord.Role] = None,
     mention_everyone: bool = False,
+    pos_name: Optional[str] = None,
 ):
     guild = interaction.guild
     if not guild:
@@ -1556,13 +1682,36 @@ async def resping_ping(
 
     await interaction.response.defer(ephemeral=True)
 
+    pos_label: Optional[str] = None
     conn = ensure_db_ready()
     try:
         cur = conn.cursor()
+        pos_id: Optional[int] = None
+        if pos_name:
+            lookup = pos_name.strip()
+            if lookup:
+                cur.execute(
+                    """
+                    SELECT id, name
+                    FROM pos
+                    WHERE guild_id=? AND LOWER(name)=LOWER(?)
+                    LIMIT 1
+                    """,
+                    (guild.id, lookup),
+                )
+                pos_row = cur.fetchone()
+                if not pos_row:
+                    await interaction.followup.send("POS с таким названием не найден.", ephemeral=True)
+                    return
+                pos_id = int(pos_row["id"])
+                pos_label = pos_row["name"]
+        created_ts = now_utc_iso()
         cur.execute(
             """
-            INSERT INTO resource_ping (guild_id, channel_id, message_id, author_user_id, content, role_id, created_at, active)
-            VALUES (?, ?, 0, ?, ?, ?, ?, 1)
+            INSERT INTO resource_ping (
+                guild_id, channel_id, message_id, author_user_id, content, role_id, created_at, active, pos_id
+            )
+            VALUES (?, ?, 0, ?, ?, ?, ?, 1, ?)
             """,
             (
                 guild.id,
@@ -1570,7 +1719,8 @@ async def resping_ping(
                 interaction.user.id,
                 body,
                 role.id if role else None,
-                now_utc_iso(),
+                created_ts,
+                pos_id,
             ),
         )
         ping_id = int(cur.lastrowid)
@@ -1590,6 +1740,8 @@ async def resping_ping(
         timestamp=datetime.now(timezone.utc),
     )
     embed.add_field(name="Отметились", value="**0**", inline=False)
+    if pos_label:
+        embed.add_field(name="POS", value=pos_label, inline=False)
     display_name = getattr(interaction.user, "display_name", interaction.user.name)
     embed.set_footer(text=f"ID: {ping_id} • Создал {display_name}")
 
@@ -1670,6 +1822,8 @@ async def resping_ping(
             f"👋 Привет! Администратор сервера **{guild.name}** создал напоминание о сдаче ресурсов.",
             f"ID напоминания: #{ping_id}.",
         ]
+        if pos_label:
+            lines.append(f"POS: {pos_label}")
         if body:
             short = body if len(body) <= 200 else body[:197] + "…"
             lines.append(f"Текст: {short}")
@@ -1683,7 +1837,7 @@ async def resping_ping(
             [
                 "",
                 "Нажми кнопку ниже, чтобы отметить сдачу.",
-                f"Можно также использовать команду `/resping submit ping_id:{ping_id}` на сервере.",
+                "Можно также использовать команду `/resping submit` на сервере (выбери свой POS из списка).",
             ]
         )
 
@@ -1697,6 +1851,8 @@ async def resping_ping(
             failed.append(user_id)
 
     summary_lines = [f"✅ Напоминание #{ping_id} создано. {message.jump_url}"]
+    if pos_label:
+        summary_lines.append(f"POS: **{pos_label}**")
     total_targets = len(user_payloads)
     if total_targets:
         summary_lines.append(
@@ -1711,13 +1867,24 @@ async def resping_ping(
 
 @resping_group.command(name="submit", description="Отправить список сданных ресурсов по напоминанию.")
 @app_commands.describe(
-    ping_id="ID напоминания о сдаче ресурсов",
+    pos="Выбери POS из списка (привязанные напоминания)",
     data="Таблица (TSV/CSV или одной строкой): [ID] Название Количество [Оценка]",
 )
-async def resping_submit(interaction: discord.Interaction, ping_id: int, data: str):
+@app_commands.autocomplete(pos=resping_submit_autocomplete)
+async def resping_submit(interaction: discord.Interaction, pos: str, data: str):
     guild = interaction.guild
     if not guild:
         await interaction.response.send_message("Только в сервере.", ephemeral=True)
+        return
+
+    raw_choice = (pos or "").strip()
+    if not raw_choice:
+        await interaction.response.send_message("Выбери POS из выпадающего списка.", ephemeral=True)
+        return
+    try:
+        ping_id = int(raw_choice)
+    except ValueError:
+        await interaction.response.send_message("Выбери POS из выпадающего списка.", ephemeral=True)
         return
 
     payload = (data or "").strip()
@@ -1779,10 +1946,17 @@ async def resping_submit(interaction: discord.Interaction, ping_id: int, data: s
     assignments: Dict[str, Dict[str, object]] = {}
     already = False
     total = 0
+    ping_pos_name: Optional[str] = None
+    ping_pos_id: Optional[int] = None
     try:
         cur = conn.cursor()
         cur.execute(
-            "SELECT guild_id, content FROM resource_ping WHERE id=?",
+            """
+            SELECT rp.guild_id, rp.content, rp.pos_id, p.name AS pos_name, p.owner_user_id
+            FROM resource_ping rp
+            LEFT JOIN pos p ON p.id = rp.pos_id
+            WHERE rp.id=?
+            """,
             (ping_id,),
         )
         ping_row = cur.fetchone()
@@ -1793,8 +1967,19 @@ async def resping_submit(interaction: discord.Interaction, ping_id: int, data: s
             return
 
         ping_content = ping_row["content"] or ""
+        ping_pos_id = ping_row["pos_id"] if ping_row["pos_id"] is not None else None
+        ping_pos_name = ping_row["pos_name"] if ping_row["pos_name"] else None
+        owner_id = ping_row["owner_user_id"] if ping_row["owner_user_id"] is not None else None
+        if owner_id is not None and owner_id != interaction.user.id and not is_admin_user(interaction):
+            await interaction.followup.send("Этот POS принадлежит другому пользователю.", ephemeral=True)
+            return
 
-        assignments = get_user_resource_assignments(conn, guild.id, interaction.user.id)
+        assignments = get_user_resource_assignments(
+            conn,
+            guild.id,
+            interaction.user.id,
+            pos_id=int(ping_pos_id) if ping_pos_id is not None else None,
+        )
         if not assignments:
             await interaction.followup.send(
                 "У тебя нет назначенных планет на этом сервере.",
@@ -1878,6 +2063,8 @@ async def resping_submit(interaction: discord.Interaction, ping_id: int, data: s
     if ping_content:
         short = ping_content if len(ping_content) <= 200 else ping_content[:197] + "…"
         summary_lines.append(f"Напоминание #{ping_id}: {short}")
+    if ping_pos_name:
+        summary_lines.append(f"POS: {ping_pos_name}")
 
     for key, entry in aggregated.items():
         info = assignments.get(key)
@@ -2192,7 +2379,7 @@ async def run_resource_reminder_cycle():
             [
                 "",
                 "Отправь отчёт об отгрузке прямо в этой ветке и отметься под основным сообщением.",
-                f"Можно также использовать команду `/resping submit ping_id:{ping_id}` на сервере.",
+                "Можно также использовать команду `/resping submit` на сервере (выбери свой POS из списка).",
                 "После отметки ветка будет удалена автоматически.",
             ]
         )
@@ -2637,7 +2824,7 @@ async def have_cmd(interaction: discord.Interaction, action: app_commands.Choice
     slots="Сколько планет-слотов назначать (по умолчанию 10)",
     drills="Сколько буров ставить на планету (по умолчанию 22)",
 )
-@app_commands.autocomplete(system=system_autocomplete)
+@app_commands.autocomplete(name=guild_pos_name_autocomplete, system=system_autocomplete)
 async def addpos_cmd(
     interaction: discord.Interaction,
     name: str,
