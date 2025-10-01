@@ -942,9 +942,44 @@ def get_guild_resource_producers(conn: sqlite3.Connection, guild_id: int) -> Lis
     return [int(r["owner_user_id"]) for r in cur.fetchall() if r["owner_user_id"] is not None]
 
 
+def _compute_ping_submission_totals(
+    cur: sqlite3.Cursor, ping_id: int, guild_id: int
+) -> Tuple[int, int, int]:
+    cur.execute(
+        "SELECT COUNT(*) AS cnt FROM resource_ping_submission WHERE ping_id=?",
+        (ping_id,),
+    )
+    total_users_row = cur.fetchone()
+    total_users = int(total_users_row["cnt"] or 0) if total_users_row else 0
+
+    cur.execute(
+        "SELECT COUNT(*) AS cnt FROM pos WHERE guild_id=?",
+        (guild_id,),
+    )
+    total_pos_row = cur.fetchone()
+    total_pos = int(total_pos_row["cnt"] or 0) if total_pos_row else 0
+
+    cur.execute(
+        """
+        SELECT COUNT(*) AS cnt
+        FROM pos p
+        WHERE p.guild_id=? AND EXISTS (
+            SELECT 1
+            FROM resource_ping_submission s
+            WHERE s.ping_id=? AND s.user_id = p.owner_user_id
+        )
+        """,
+        (guild_id, ping_id),
+    )
+    submitted_pos_row = cur.fetchone()
+    submitted_pos = int(submitted_pos_row["cnt"] or 0) if submitted_pos_row else 0
+
+    return total_users, submitted_pos, total_pos
+
+
 def record_ping_submission(
     cur: sqlite3.Cursor, ping_id: int, user_id: int, submitted_at: Optional[str] = None
-) -> Tuple[bool, int, int]:
+) -> Tuple[bool, int, int, int, int, int]:
     cur.execute("SELECT guild_id, active FROM resource_ping WHERE id=?", (ping_id,))
     ping_row = cur.fetchone()
     if not ping_row:
@@ -973,12 +1008,15 @@ def record_ping_submission(
         (ping_id, user_id),
     )
     cur.execute(
-        "SELECT COUNT(*) AS cnt FROM resource_ping_submission WHERE ping_id=?",
-        (ping_id,),
+        "SELECT COUNT(*) AS cnt FROM pos WHERE guild_id=? AND owner_user_id=?",
+        (guild_id, user_id),
     )
-    total_row = cur.fetchone()
-    total = int(total_row["cnt"] or 0) if total_row else 0
-    return already, total, guild_id
+    user_pos_row = cur.fetchone()
+    user_pos_count = int(user_pos_row["cnt"] or 0) if user_pos_row else 0
+
+    total_users, submitted_pos, total_pos = _compute_ping_submission_totals(cur, ping_id, guild_id)
+
+    return already, total_users, guild_id, user_pos_count, submitted_pos, total_pos
 
 
 def get_ping_thread_id(conn: sqlite3.Connection, ping_id: int, user_id: int) -> Optional[int]:
@@ -1128,7 +1166,12 @@ async def close_ping_thread(ping_id: int, user_id: int, reason: Optional[str] = 
 
 
 async def update_ping_message_embed(
-    message: Optional[discord.Message], total: int, view: Optional[discord.ui.View] = None
+    message: Optional[discord.Message],
+    total_users: int,
+    *,
+    submitted_pos: Optional[int] = None,
+    total_pos: Optional[int] = None,
+    view: Optional[discord.ui.View] = None,
 ):
     if not message:
         return
@@ -1141,7 +1184,11 @@ async def update_ping_message_embed(
         if field.name.lower().startswith("отметил"):
             field_index = idx
             break
-    value_text = f"**{total}**"
+    value_lines = [f"**{total_users}**"]
+    if total_pos is not None and total_pos > 0:
+        covered = submitted_pos or 0
+        value_lines.append(f"POS покрыто: **{covered}/{total_pos}**")
+    value_text = "\n".join(value_lines)
     if field_index is not None:
         field_name = embed.fields[field_index].name
         embed.set_field_at(field_index, name=field_name, value=value_text, inline=False)
@@ -1154,21 +1201,26 @@ async def update_ping_message_embed(
     await message.edit(**kwargs)
 
 
-async def update_ping_message_from_db(ping_id: int, total: int):
+async def update_ping_message_from_db(ping_id: int):
     conn = ensure_db_ready()
     channel_id = None
     message_id = None
+    total_users = 0
+    submitted_pos = 0
+    total_pos = 0
     try:
         cur = conn.cursor()
         cur.execute(
-            "SELECT channel_id, message_id FROM resource_ping WHERE id=?",
+            "SELECT guild_id, channel_id, message_id FROM resource_ping WHERE id=?",
             (ping_id,),
         )
         row = cur.fetchone()
         if not row:
             return
+        guild_id = int(row["guild_id"])
         channel_id = int(row["channel_id"])
         message_id = int(row["message_id"])
+        total_users, submitted_pos, total_pos = _compute_ping_submission_totals(cur, ping_id, guild_id)
     finally:
         conn.close()
 
@@ -1200,7 +1252,12 @@ async def update_ping_message_from_db(ping_id: int, total: int):
         )
         return
 
-    await update_ping_message_embed(message, total)
+    await update_ping_message_embed(
+        message,
+        total_users,
+        submitted_pos=submitted_pos,
+        total_pos=total_pos,
+    )
 
 
 class ResourceSubmitButton(discord.ui.Button):
@@ -1219,10 +1276,20 @@ class ResourceSubmitButton(discord.ui.Button):
 
         conn = ensure_db_ready()
         already = False
-        total = 0
+        total_users = 0
+        user_pos_count = 0
+        submitted_pos = 0
+        total_pos = 0
         try:
             cur = conn.cursor()
-            already, total, _guild_id = record_ping_submission(cur, self.ping_id, interaction.user.id)
+            (
+                already,
+                total_users,
+                _guild_id,
+                user_pos_count,
+                submitted_pos,
+                total_pos,
+            ) = record_ping_submission(cur, self.ping_id, interaction.user.id)
             conn.commit()
         except PingNotFoundError:
             await interaction.followup.send("Напоминание больше не доступно.", ephemeral=True)
@@ -1238,7 +1305,13 @@ class ResourceSubmitButton(discord.ui.Button):
             conn.close()
 
         try:
-            await update_ping_message_embed(interaction.message, total, view=self.view)
+            await update_ping_message_embed(
+                interaction.message,
+                total_users,
+                submitted_pos=submitted_pos,
+                total_pos=total_pos,
+                view=self.view,
+            )
         except Exception as e:
             logger.exception("Не удалось обновить сообщение напоминания %s: %s", self.ping_id, e)
 
@@ -1256,7 +1329,17 @@ class ResourceSubmitButton(discord.ui.Button):
                 e,
             )
 
-        info = "ℹ️ Ты уже отмечался, время обновлено." if already else "✅ Отметил сдачу. Спасибо!"
+        if already:
+            info = "ℹ️ Ты уже отмечался, время обновлено."
+        else:
+            if user_pos_count > 1:
+                info = f"✅ Отметил сдачу по {user_pos_count} POS. Спасибо!"
+            elif user_pos_count == 1:
+                info = "✅ Отметил сдачу. Спасибо!"
+            else:
+                info = "✅ Отметил сдачу. Спасибо!"
+        if total_pos > 0:
+            info += f"\nПокрытие POS по напоминанию: {submitted_pos}/{total_pos}."
         await interaction.followup.send(info, ephemeral=True)
 
 class ResourcePingView(discord.ui.View):
@@ -1778,7 +1861,10 @@ async def resping_submit(interaction: discord.Interaction, ping_id: int, data: s
     ping_content = ""
     assignments: Dict[str, Dict[str, object]] = {}
     already = False
-    total = 0
+    total_users = 0
+    user_pos_count = 0
+    submitted_pos = 0
+    total_pos = 0
     try:
         cur = conn.cursor()
         cur.execute(
@@ -1840,7 +1926,14 @@ async def resping_submit(interaction: discord.Interaction, ping_id: int, data: s
                 ),
             )
 
-        already, total, _ = record_ping_submission(cur, ping_id, interaction.user.id, submitted_at=ts)
+        (
+            already,
+            total_users,
+            _guild_id,
+            user_pos_count,
+            submitted_pos,
+            total_pos,
+        ) = record_ping_submission(cur, ping_id, interaction.user.id, submitted_at=ts)
         conn.commit()
     except PingNotFoundError:
         await interaction.followup.send("Напоминание не найдено.", ephemeral=True)
@@ -1856,7 +1949,7 @@ async def resping_submit(interaction: discord.Interaction, ping_id: int, data: s
         conn.close()
 
     try:
-        await update_ping_message_from_db(ping_id, total)
+        await update_ping_message_from_db(ping_id)
     except Exception as e:
         logger.exception("Не удалось обновить сообщение напоминания %s: %s", ping_id, e)
 
@@ -1897,6 +1990,16 @@ async def resping_submit(interaction: discord.Interaction, ping_id: int, data: s
     missing = [info["name"] for key, info in assignments.items() if key not in aggregated]
     if missing:
         summary_lines.append("⚠️ В отчёт не попали ресурсы: " + ", ".join(missing))
+
+    if user_pos_count > 1:
+        summary_lines.append(f"У тебя **{user_pos_count}** POS — отчёт отмечен для всех.")
+    elif user_pos_count == 1:
+        summary_lines.append("Твой POS учтён.")
+
+    if total_pos > 0:
+        summary_lines.append(
+            f"Покрытие POS по напоминанию: **{submitted_pos}/{total_pos}**."
+        )
 
     summary_lines.append("ℹ️ " + ("Время сдачи обновлено." if already else "Сдача сохранена."))
 
