@@ -1908,7 +1908,7 @@ async def resping_ping(
             [
                 "",
                 "Нажми кнопку ниже, чтобы отметить сдачу.",
-                f"Можно также использовать команду `/resping submit ping_id:{ping_id}` на сервере.",
+                "Можно также использовать команду `/resping submit` на сервере.",
             ]
         )
 
@@ -1934,80 +1934,158 @@ async def resping_ping(
     await interaction.followup.send("\n".join(summary_lines), ephemeral=True)
 
 
+def resolve_active_ping_for_user(
+    conn: sqlite3.Connection,
+    guild_id: int,
+    user_id: int,
+    *,
+    thread_id: Optional[int] = None,
+) -> Tuple[Optional[int], List[int]]:
+    """Определяет актуальное напоминание для пользователя.
+
+    Возвращает (ping_id, ambiguous_ids). Если ping_id отсутствует и список ambiguous
+    непустой — требуется уточнение (несколько напоминаний без отметки).
+    """
+    cur = conn.cursor()
+
+    if thread_id is not None:
+        cur.execute(
+            """
+            SELECT rpt.ping_id
+            FROM resource_ping_thread rpt
+            JOIN resource_ping p ON p.id = rpt.ping_id
+            WHERE rpt.thread_id=? AND rpt.user_id=? AND p.guild_id=? AND p.active=1
+            """,
+            (int(thread_id), int(user_id), int(guild_id)),
+        )
+        row = cur.fetchone()
+        if row:
+            return int(row["ping_id"]), []
+
+    cur.execute(
+        """
+        SELECT p.id,
+               CASE WHEN s.user_id IS NULL THEN 0 ELSE 1 END AS submitted
+        FROM resource_ping p
+        LEFT JOIN resource_ping_submission s
+          ON s.ping_id = p.id AND s.user_id = ?
+        WHERE p.guild_id=? AND p.active=1
+        ORDER BY p.created_at DESC, p.id DESC
+        """,
+        (int(user_id), int(guild_id)),
+    )
+    rows = cur.fetchall()
+    if not rows:
+        return None, []
+
+    pending = [int(r["id"]) for r in rows if not bool(r["submitted"])]
+    if len(pending) == 1:
+        return pending[0], []
+    if len(pending) > 1:
+        return None, pending
+
+    return int(rows[0]["id"]), []
+
+
 @resping_group.command(name="submit", description="Отправить список сданных ресурсов по напоминанию.")
 @app_commands.describe(
-    ping_id="ID напоминания о сдаче ресурсов",
     data="Таблица (TSV/CSV или одной строкой): [ID] Название Количество [Оценка]",
 )
-async def resping_submit(interaction: discord.Interaction, ping_id: int, data: str):
+async def resping_submit(interaction: discord.Interaction, data: Optional[str] = None):
     guild = interaction.guild
     if not guild:
         await interaction.response.send_message("Только в сервере.", ephemeral=True)
         return
 
+    channel = interaction.channel
+    thread_id: Optional[int] = channel.id if isinstance(channel, discord.Thread) else None
+
     payload = (data or "").strip()
-    if not payload:
-        await interaction.response.send_message("Вставь таблицу в параметр `data`.", ephemeral=True)
-        return
-
-    await interaction.response.defer(ephemeral=True)
-
-    items = parse_have_table(payload)
-    if not items:
-        await interaction.followup.send("Не удалось распарсить данные. Проверь колонки/формат.", ephemeral=True)
-        return
-
-    aggregated: OrderedDict[str, Dict[str, object]] = OrderedDict()
-    invalid_amounts: List[str] = []
-    for name, amount, unit_price in items:
-        resource = clean_resource_name(name)
-        if not resource or amount is None:
-            continue
-        try:
-            amount_val = float(amount)
-        except Exception:
-            continue
-        if amount_val <= 0:
-            invalid_amounts.append(resource)
-            continue
-        key = resource.lower()
-        entry = aggregated.get(key)
-        if not entry:
-            entry = {"name": resource, "amount": 0.0, "prices": []}
-            aggregated[key] = entry
-        entry["amount"] += amount_val
-        if unit_price is not None:
-            try:
-                entry.setdefault("prices", []).append(float(unit_price))
-            except Exception:
-                pass
-
-    if invalid_amounts:
-        pretty = ", ".join(sorted(set(invalid_amounts)))
-        await interaction.followup.send(
-            f"Количество должно быть положительным. Проверь: {pretty}.",
-            ephemeral=True,
-        )
-        return
-
-    if not aggregated:
-        await interaction.followup.send("После фильтрации данных ничего не осталось.", ephemeral=True)
-        return
-
-    for entry in aggregated.values():
-        prices = entry.get("prices", [])
-        entry["unit_price"] = sum(prices) / len(prices) if prices else None
-        entry.pop("prices", None)
+    had_payload = bool(payload)
 
     conn = ensure_db_ready()
-    ping_content = ""
+    aggregated: OrderedDict[str, Dict[str, object]] = OrderedDict()
     assignments: Dict[str, Dict[str, object]] = {}
+    ping_content = ""
     already = False
     total_users = 0
     user_pos_count = 0
     submitted_pos = 0
     total_pos = 0
+    submission_saved = False
     try:
+        ping_id, ambiguous = resolve_active_ping_for_user(
+            conn,
+            guild.id,
+            interaction.user.id,
+            thread_id=thread_id,
+        )
+        if ping_id is None:
+            if ambiguous:
+                listed = ", ".join(f"#{pid}" for pid in ambiguous[:5])
+                if len(ambiguous) > 5:
+                    listed += f" и ещё {len(ambiguous) - 5}"
+                await interaction.response.send_message(
+                    "На сервере есть несколько активных напоминаний, по которым ты ещё не отметился: "
+                    + listed
+                    + ". Запусти команду из ветки нужного напоминания или отметься кнопкой \"Сдал\".",
+                    ephemeral=True,
+                )
+            else:
+                await interaction.response.send_message(
+                    "Нет активных напоминаний, к которым можно отправить отчёт.",
+                    ephemeral=True,
+                )
+            return
+
+        if payload:
+            items = parse_have_table(payload)
+            if not items:
+                await interaction.response.send_message(
+                    "Не удалось распарсить данные. Проверь колонки/формат.",
+                    ephemeral=True,
+                )
+                return
+
+            invalid_amounts: List[str] = []
+            for name, amount, unit_price in items:
+                resource = clean_resource_name(name)
+                if not resource or amount is None:
+                    continue
+                try:
+                    amount_val = float(amount)
+                except Exception:
+                    continue
+                if amount_val < 0:
+                    invalid_amounts.append(resource)
+                    continue
+                key = resource.lower()
+                entry = aggregated.get(key)
+                if not entry:
+                    entry = {"name": resource, "amount": 0.0, "prices": []}
+                    aggregated[key] = entry
+                entry["amount"] += amount_val
+                if unit_price is not None:
+                    try:
+                        entry.setdefault("prices", []).append(float(unit_price))
+                    except Exception:
+                        pass
+
+            if invalid_amounts:
+                pretty = ", ".join(sorted(set(invalid_amounts)))
+                await interaction.response.send_message(
+                    f"Количество не может быть отрицательным. Проверь: {pretty}.",
+                    ephemeral=True,
+                )
+                return
+
+        for entry in aggregated.values():
+            prices = entry.get("prices", [])
+            entry["unit_price"] = sum(prices) / len(prices) if prices else None
+            entry.pop("prices", None)
+
+        await interaction.response.defer(ephemeral=True)
+
         cur = conn.cursor()
         cur.execute(
             "SELECT guild_id, content FROM resource_ping WHERE id=?",
@@ -2017,7 +2095,7 @@ async def resping_submit(interaction: discord.Interaction, ping_id: int, data: s
         if not ping_row:
             raise PingNotFoundError(f"Ping {ping_id} not found")
         if int(ping_row["guild_id"]) != guild.id:
-            await interaction.followup.send("Этот ID относится к другому серверу.", ephemeral=True)
+            await interaction.followup.send("Это напоминание относится к другому серверу.", ephemeral=True)
             return
 
         ping_content = ping_row["content"] or ""
@@ -2077,6 +2155,7 @@ async def resping_submit(interaction: discord.Interaction, ping_id: int, data: s
             total_pos,
         ) = record_ping_submission(cur, ping_id, interaction.user.id, submitted_at=ts)
         conn.commit()
+        submission_saved = True
     except PingNotFoundError:
         await interaction.followup.send("Напоминание не найдено.", ephemeral=True)
         return
@@ -2089,6 +2168,9 @@ async def resping_submit(interaction: discord.Interaction, ping_id: int, data: s
         return
     finally:
         conn.close()
+
+    if not submission_saved:
+        return
 
     try:
         await update_ping_message_from_db(ping_id)
@@ -2114,24 +2196,30 @@ async def resping_submit(interaction: discord.Interaction, ping_id: int, data: s
         short = ping_content if len(ping_content) <= 200 else ping_content[:197] + "…"
         summary_lines.append(f"Напоминание #{ping_id}: {short}")
 
-    for key, entry in aggregated.items():
-        info = assignments.get(key)
-        expected = float(info["rate_total"]) * 24 if info else 0.0
-        diff = entry["amount"] - expected
-        ratio = (entry["amount"] / expected) if expected > 0 else None
-        line = f"- {entry['name']}: **{entry['amount']:,.0f}** ед".replace(",", " ")
-        if expected > 0:
-            line += (
-                f" (≈ {expected:,.0f} за 24ч; Δ {diff:+,.0f} ед"
-            ).replace(",", " ")
-            if ratio is not None:
-                line += f", {ratio*100:.0f}%"
-            line += ")"
-        summary_lines.append(line)
+    if aggregated:
+        for key, entry in aggregated.items():
+            info = assignments.get(key)
+            expected = float(info["rate_total"]) * 24 if info else 0.0
+            diff = entry["amount"] - expected
+            ratio = (entry["amount"] / expected) if expected > 0 else None
+            line = f"- {entry['name']}: **{entry['amount']:,.0f}** ед".replace(",", " ")
+            if expected > 0:
+                line += (
+                    f" (≈ {expected:,.0f} за 24ч; Δ {diff:+,.0f} ед"
+                ).replace(",", " ")
+                if ratio is not None:
+                    line += f", {ratio*100:.0f}%"
+                line += ")"
+            summary_lines.append(line)
 
-    missing = [info["name"] for key, info in assignments.items() if key not in aggregated]
-    if missing:
-        summary_lines.append("⚠️ В отчёт не попали ресурсы: " + ", ".join(missing))
+        missing = [info["name"] for key, info in assignments.items() if key not in aggregated]
+        if missing:
+            summary_lines.append("⚠️ В отчёт не попали ресурсы: " + ", ".join(missing))
+    else:
+        if had_payload:
+            summary_lines.append("⚠️ Не удалось распознать ресурсы в таблице — отчёт сохранён без них.")
+        else:
+            summary_lines.append("Ресурсы не указаны — отчёт сохранён без таблицы.")
 
     if user_pos_count > 1:
         summary_lines.append(f"У тебя **{user_pos_count}** POS — отчёт отмечен для всех.")
@@ -2587,7 +2675,7 @@ async def run_resource_reminder_cycle():
             [
                 "",
                 "Отправь отчёт об отгрузке прямо в этой ветке и отметься под основным сообщением.",
-                f"Можно также использовать команду `/resping submit ping_id:{ping_id}` на сервере.",
+                "Можно также использовать команду `/resping submit` на сервере.",
                 "После отметки ветка будет удалена автоматически.",
             ]
         )
