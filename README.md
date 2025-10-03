@@ -49,6 +49,8 @@ DB_PATH=/var/lib/pii_bot/planets.db /opt/pii_bot/.venv/bin/python PII_BOT.py
 | `DEFAULT_BETA` | Коэффициент достоверности добычи | `0.85` |
 | `RES_REMINDER_DELAY_HOURS` | Через сколько часов напомнить повторно | `24` |
 | `RES_REMINDER_CHECK_SECONDS` | Как часто проверять напоминания | `3600` |
+| `BOT_UPDATE_BRANCH` | Ветка git для команды `/updatebot` по умолчанию | (ветка установки) |
+| `GITHUB_TOKEN` | Токен GitHub (PAT) для доступа к приватному репозиторию | _не задан_ |
 
 ## Команды
 
