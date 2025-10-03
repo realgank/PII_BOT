@@ -28,6 +28,18 @@ DATA_DIR="/var/lib/pii_bot"
 INSTALL_DEPS=1
 APT_UPDATED=0
 
+to_systemd_unit_name() {
+    local name="$1"
+    name=$(echo "$name" | tr '[:upper:]' '[:lower:]')
+    name=$(echo "$name" | sed 's/[^a-z0-9]/-/g')
+    name=$(echo "$name" | sed 's/-\{2,\}/-/g')
+    name=$(echo "$name" | sed 's/^-\+//; s/-\+$//')
+    if [[ -z "$name" ]]; then
+        name="pii-bot"
+    fi
+    printf '%s' "$name"
+}
+
 sanitize_env_var() {
     local name="$1"
     name=$(echo "$name" | tr '[:lower:]' '[:upper:]')
@@ -259,6 +271,74 @@ if [[ -n "${BOT_UPDATE_BRANCH_VALUE}" ]]; then
 fi
 
 chmod 600 "$ENV_FILE"
+
+DEFAULT_SERVICE_UNIT_NAME=$(to_systemd_unit_name "$(basename "$INSTALL_DIR")")
+DEFAULT_SERVICE_UNIT_FILE="${DEFAULT_SERVICE_UNIT_NAME}.service"
+read -r -p "Создать systemd-службу для автозапуска бота? [Y/n]: " CREATE_SERVICE_CHOICE
+if [[ -z "${CREATE_SERVICE_CHOICE}" || $CREATE_SERVICE_CHOICE =~ ^[YyАаДд] ]]; then
+    read -r -p "Имя сервиса [${DEFAULT_SERVICE_UNIT_FILE}]: " SERVICE_UNIT_INPUT
+    if [[ -z "${SERVICE_UNIT_INPUT}" ]]; then
+        SERVICE_UNIT_INPUT="$DEFAULT_SERVICE_UNIT_FILE"
+    fi
+    SERVICE_UNIT_INPUT=$(to_systemd_unit_name "${SERVICE_UNIT_INPUT%.service}")
+    SERVICE_UNIT_INPUT="${SERVICE_UNIT_INPUT}.service"
+
+    DEFAULT_SERVICE_USER="${SUDO_USER:-$(logname 2>/dev/null || true)}"
+    if [[ -z "$DEFAULT_SERVICE_USER" ]]; then
+        DEFAULT_SERVICE_USER="$(whoami)"
+    fi
+    read -r -p "Пользователь, от имени которого запускать сервис [$DEFAULT_SERVICE_USER]: " SERVICE_USER_INPUT
+    if [[ -z "${SERVICE_USER_INPUT}" ]]; then
+        SERVICE_USER_INPUT="$DEFAULT_SERVICE_USER"
+    fi
+
+    SERVICE_FILE_PATH="/etc/systemd/system/${SERVICE_UNIT_INPUT}"
+    if [[ $EUID -ne 0 ]]; then
+        echo "⚠️  Недостаточно прав для записи в $SERVICE_FILE_PATH. Запустите скрипт с правами root или создайте юнит вручную." >&2
+    else
+        SERVICE_EXEC="source \"$ENV_FILE\" && exec \"$INSTALL_DIR/.venv/bin/python\" \"$INSTALL_DIR/PII_BOT.py\""
+        SERVICE_EXEC_ESCAPED=$(printf '%s' "$SERVICE_EXEC" | sed "s/'/'\\\\''/g")
+
+        echo "Создаю systemd-сервис в $SERVICE_FILE_PATH"
+        if [[ -f "$SERVICE_FILE_PATH" ]]; then
+            SERVICE_BACKUP="$SERVICE_FILE_PATH.bak.$(date +%s)"
+            cp "$SERVICE_FILE_PATH" "$SERVICE_BACKUP"
+            echo "Существующий файл сервиса сохранён как $SERVICE_BACKUP"
+        fi
+        cat >"$SERVICE_FILE_PATH" <<SERVICE_UNIT
+[Unit]
+Description=PII BOT (${INSTALL_DIR})
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${SERVICE_USER_INPUT}
+WorkingDirectory=${INSTALL_DIR}
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/bin/bash -lc '${SERVICE_EXEC_ESCAPED}'
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+SERVICE_UNIT
+
+        if command -v systemctl >/dev/null 2>&1; then
+            echo "Перезагружаю конфигурацию systemd"
+            systemctl daemon-reload
+            if systemctl enable --now "$SERVICE_UNIT_INPUT"; then
+                echo "Служба $SERVICE_UNIT_INPUT включена и запущена."
+            else
+                echo "Не удалось запустить или включить $SERVICE_UNIT_INPUT. Проверьте сообщения об ошибках." >&2
+            fi
+        else
+            echo "⚠️  Команда systemctl не найдена. Созданный юнит необходимо активировать вручную."
+        fi
+    fi
+else
+    echo "Создание systemd-сервиса пропущено по запросу пользователя."
+fi
 
 echo "Готово. Для запуска укажите переменную окружения DB_PATH=$DB_PATH_VALUE"
 echo "Пример: DB_PATH=$DB_PATH_VALUE ${INSTALL_DIR}/.venv/bin/python PII_BOT.py"
