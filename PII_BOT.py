@@ -6,11 +6,49 @@ import sqlite3
 import pathlib
 import asyncio
 import shutil
-from typing import Dict, List, Optional, Tuple, Union
-from datetime import datetime, timezone, timedelta
 import re
 import base64
 from collections import OrderedDict
+from datetime import datetime, timezone, timedelta
+from typing import Dict, List, Optional, Tuple, Union
+
+PROJECT_ROOT = pathlib.Path(__file__).resolve().parent
+
+
+def _load_env_file() -> None:
+    """Загружает переменные окружения из .env, если такой файл существует."""
+
+    env_path = PROJECT_ROOT / ".env"
+    if not env_path.exists():
+        return
+
+    try:
+        content = env_path.read_text(encoding="utf-8")
+    except OSError:
+        return
+
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :]
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if not key:
+            continue
+        value = value.strip()
+        if (value.startswith("\"") and value.endswith("\"")) or (
+            value.startswith("'") and value.endswith("'")
+        ):
+            value = value[1:-1]
+        if key not in os.environ:
+            os.environ[key] = value
+
+
+_load_env_file()
 
 import discord
 from discord import app_commands
@@ -21,8 +59,15 @@ DB_PATH = os.getenv("DB_PATH", "planets.db")
 LOG_DIR = os.getenv("LOG_DIR", "logs")
 LOG_LEVEL_NAME = os.getenv("LOG_LEVEL", "INFO")
 
+TOKEN_ENV_NAME = os.getenv("PII_BOT_TOKEN_ENV", "DISCORD_TOKEN")
+DISCORD_TOKEN = os.getenv(TOKEN_ENV_NAME)
 
-DISCORD_TOKEN = "MTI4MDc4ODMxOTE3MjY5NDA4OQ.Guekgr.GvXCHpCJ_J5C0lEJQ7L-FqioOAA9YWRcMN_u3A"
+if not DISCORD_TOKEN:
+    raise RuntimeError(
+        "Не удалось найти токен Discord. Установите переменную окружения "
+        f"{TOKEN_ENV_NAME!r} или укажите корректное имя переменной в "
+        "PII_BOT_TOKEN_ENV."
+    )
 
 DEFAULT_SLOTS = int(os.getenv("DEFAULT_SLOTS", "10"))
 DEFAULT_DRILLS = int(os.getenv("DEFAULT_DRILLS", "22"))
@@ -33,7 +78,6 @@ RES_REMINDER_DELAY_HOURS = int(os.getenv("RES_REMINDER_DELAY_HOURS", "24"))
 RES_REMINDER_CHECK_SECONDS = int(os.getenv("RES_REMINDER_CHECK_SECONDS", str(60 * 60)))
 
 reminder_task: Optional[asyncio.Task] = None
-PROJECT_ROOT = pathlib.Path(__file__).resolve().parent
 
 # ==================== ЛОГИ ====================
 LOG_LEVEL = getattr(logging, LOG_LEVEL_NAME.upper(), logging.INFO)
