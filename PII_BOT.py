@@ -1,9 +1,11 @@
 ﻿# bot_pos.py
 import os
+import sys
 import logging
 import sqlite3
 import pathlib
 import asyncio
+import shutil
 from typing import Dict, List, Optional, Tuple, Union
 from datetime import datetime, timezone, timedelta
 import re
@@ -31,6 +33,7 @@ RES_REMINDER_DELAY_HOURS = int(os.getenv("RES_REMINDER_DELAY_HOURS", "24"))
 RES_REMINDER_CHECK_SECONDS = int(os.getenv("RES_REMINDER_CHECK_SECONDS", str(60 * 60)))
 
 reminder_task: Optional[asyncio.Task] = None
+PROJECT_ROOT = pathlib.Path(__file__).resolve().parent
 
 # ==================== ЛОГИ ====================
 LOG_LEVEL = getattr(logging, LOG_LEVEL_NAME.upper(), logging.INFO)
@@ -109,6 +112,75 @@ async def send_long(interaction: discord.Interaction, text: str, ephemeral: bool
     for i, ch in enumerate(chunks, 1):
         header = f"{title} (часть {i}/{total})\n" if total > 1 else ""
         await interaction.followup.send(header + ch, ephemeral=ephemeral)
+
+
+async def run_subprocess(cmd: List[str], cwd: Optional[pathlib.Path] = None) -> Tuple[int, str, str]:
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        cwd=str(cwd) if cwd else None,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate()
+    return (
+        proc.returncode,
+        stdout.decode("utf-8", errors="ignore"),
+        stderr.decode("utf-8", errors="ignore"),
+    )
+
+
+async def update_bot_repository(branch: Optional[str], reinstall_deps: bool) -> Tuple[bool, str]:
+    git_path = shutil.which("git")
+    if not git_path:
+        return False, "Команда git не найдена на сервере."
+
+    repo_dir = PROJECT_ROOT
+    if not (repo_dir / ".git").exists():
+        return False, f"Каталог {repo_dir} не является git-репозиторием."
+
+    target_branch = branch or os.getenv("BOT_UPDATE_BRANCH") or ""
+    commands: List[List[str]] = []
+
+    if target_branch:
+        commands.append([git_path, "fetch", "origin", target_branch])
+        commands.append([git_path, "checkout", target_branch])
+        commands.append([git_path, "pull", "--ff-only", "origin", target_branch])
+    else:
+        commands.append([git_path, "pull", "--ff-only"])
+
+    logs: List[str] = []
+
+    for cmd in commands:
+        code, out, err = await run_subprocess(cmd, repo_dir)
+        logs.append("$ " + " ".join(cmd))
+        if out.strip():
+            logs.append(out.strip())
+        if err.strip():
+            logs.append(err.strip())
+        if code != 0:
+            logs.append(f"Команда завершилась с кодом {code}.")
+            return False, "\n".join(logs)
+
+    if reinstall_deps:
+        req_file = repo_dir / "requirements.txt"
+        if not req_file.exists():
+            logs.append("requirements.txt не найден, пропускаю установку зависимостей.")
+        else:
+            pip_cmd = [sys.executable, "-m", "pip", "install", "-r", str(req_file)]
+            code, out, err = await run_subprocess(pip_cmd, repo_dir)
+            logs.append("$ " + " ".join(pip_cmd))
+            if out.strip():
+                logs.append(out.strip())
+            if err.strip():
+                logs.append(err.strip())
+            if code != 0:
+                logs.append(f"Команда завершилась с кодом {code}.")
+                return False, "\n".join(logs)
+
+    if not logs:
+        logs.append("Команды выполнены.")
+
+    return True, "\n".join(logs)
 
 # --- проверка токена Discord ---
 def validate_and_clean_token(raw: Optional[str]) -> Optional[str]:
@@ -3408,6 +3480,41 @@ async def posstats_cmd(interaction: discord.Interaction):
         await interaction.followup.send(f"Ошибка: {e}", ephemeral=True)
     finally:
         conn.close()
+
+# --- Обновление бота из Discord ---
+@tree.command(name="updatebot", description="Обновить код бота из GitHub (только для администраторов).")
+@app_commands.describe(
+    branch="Ветка git для обновления (опционально)",
+    reinstall_deps="Переустановить зависимости из requirements.txt после git pull",
+)
+async def updatebot_cmd(
+    interaction: discord.Interaction,
+    branch: Optional[str] = None,
+    reinstall_deps: bool = False,
+):
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("Команда доступна только в сервере.", ephemeral=True)
+        return
+    if not is_admin_user(interaction):
+        await interaction.response.send_message("Требуются права администратора сервера.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    try:
+        success, log_text = await update_bot_repository(branch, reinstall_deps)
+        status = "✅ Обновление завершено успешно." if success else "⚠️ Обновление завершилось с ошибкой."
+        tail = "\n\nНе забудьте перезапустить процесс/сервис бота при необходимости."
+        await send_long(
+            interaction,
+            f"{status}\n\n{log_text}{tail}",
+            ephemeral=True,
+            title="Обновление бота",
+        )
+    except Exception as e:
+        logger.exception("updatebot error: %s", e)
+        await interaction.followup.send(f"Ошибка при обновлении: {e}", ephemeral=True)
+
 
 # --- НОВОЕ: мои назначения (планеты/буры) ---
 @tree.command(name="myassigns", description="Список планет/буров по моим POS (опционально по одному POS).")
