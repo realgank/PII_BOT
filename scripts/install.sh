@@ -171,6 +171,62 @@ fi
 TOKEN_ENV_NAME="$SANITIZED_TOKEN_ENV"
 
 ENV_FILE="$INSTALL_DIR/.env"
+read -r -p "Путь к файлу базы данных [$DB_TARGET]: " DB_PATH_VALUE
+if [[ -z "${DB_PATH_VALUE}" ]]; then
+    DB_PATH_VALUE="$DB_TARGET"
+fi
+
+DEFAULT_LOG_DIR="$INSTALL_DIR/logs"
+read -r -p "Каталог для логов [$DEFAULT_LOG_DIR]: " LOG_DIR_VALUE
+if [[ -z "${LOG_DIR_VALUE}" ]]; then
+    LOG_DIR_VALUE="$DEFAULT_LOG_DIR"
+fi
+
+read -r -p "Уровень логирования (DEBUG/INFO/...) [INFO]: " LOG_LEVEL_VALUE
+if [[ -z "${LOG_LEVEL_VALUE}" ]]; then
+    LOG_LEVEL_VALUE="INFO"
+fi
+
+read -r -p "Слоты POS по умолчанию [10]: " DEFAULT_SLOTS_VALUE
+if [[ -z "${DEFAULT_SLOTS_VALUE}" ]]; then
+    DEFAULT_SLOTS_VALUE="10"
+fi
+
+read -r -p "Количество буров по умолчанию [22]: " DEFAULT_DRILLS_VALUE
+if [[ -z "${DEFAULT_DRILLS_VALUE}" ]]; then
+    DEFAULT_DRILLS_VALUE="22"
+fi
+
+read -r -p "Горизонт прогноза (часов) [168]: " DEFAULT_HOURS_VALUE
+if [[ -z "${DEFAULT_HOURS_VALUE}" ]]; then
+    DEFAULT_HOURS_VALUE="168"
+fi
+
+read -r -p "Коэффициент достоверности добычи [0.85]: " DEFAULT_BETA_VALUE
+if [[ -z "${DEFAULT_BETA_VALUE}" ]]; then
+    DEFAULT_BETA_VALUE="0.85"
+fi
+
+read -r -p "Задержка повторного напоминания (часов) [24]: " RES_REMINDER_DELAY_HOURS_VALUE
+if [[ -z "${RES_REMINDER_DELAY_HOURS_VALUE}" ]]; then
+    RES_REMINDER_DELAY_HOURS_VALUE="24"
+fi
+
+read -r -p "Период проверки напоминаний (секунд) [3600]: " RES_REMINDER_CHECK_SECONDS_VALUE
+if [[ -z "${RES_REMINDER_CHECK_SECONDS_VALUE}" ]]; then
+    RES_REMINDER_CHECK_SECONDS_VALUE="3600"
+fi
+
+echo -n "GitHub токен (PAT) для доступа к репозиторию (опционально): "
+read -r -s GITHUB_TOKEN_VALUE
+echo
+
+DEFAULT_UPDATE_BRANCH="$BRANCH"
+read -r -p "Ветка по умолчанию для команды обновления бота [${DEFAULT_UPDATE_BRANCH:-<пусто>}]: " BOT_UPDATE_BRANCH_VALUE
+if [[ -z "${BOT_UPDATE_BRANCH_VALUE}" ]]; then
+    BOT_UPDATE_BRANCH_VALUE="$DEFAULT_UPDATE_BRANCH"
+fi
+
 echo "Записываю переменные окружения в $ENV_FILE"
 if [[ -f "$ENV_FILE" ]]; then
     BACKUP_FILE="$ENV_FILE.bak.$(date +%s)"
@@ -182,11 +238,28 @@ cat >"$ENV_FILE" <<ENVFILE
 # Автоматически создано install.sh $(date -u +%Y-%m-%dT%H:%M:%SZ)
 export ${TOKEN_ENV_NAME}="${DISCORD_TOKEN_VALUE}"
 export PII_BOT_TOKEN_ENV="${TOKEN_ENV_NAME}"
-export DB_PATH="${DB_TARGET}"
+export DB_PATH="${DB_PATH_VALUE}"
+export LOG_DIR="${LOG_DIR_VALUE}"
+export LOG_LEVEL="${LOG_LEVEL_VALUE}"
+export DEFAULT_SLOTS="${DEFAULT_SLOTS_VALUE}"
+export DEFAULT_DRILLS="${DEFAULT_DRILLS_VALUE}"
+export DEFAULT_HOURS="${DEFAULT_HOURS_VALUE}"
+export DEFAULT_BETA="${DEFAULT_BETA_VALUE}"
+export RES_REMINDER_DELAY_HOURS="${RES_REMINDER_DELAY_HOURS_VALUE}"
+export RES_REMINDER_CHECK_SECONDS="${RES_REMINDER_CHECK_SECONDS_VALUE}"
 ENVFILE
+
+if [[ -n "${GITHUB_TOKEN_VALUE}" ]]; then
+    ESCAPED_GITHUB_TOKEN=$(printf '%s' "${GITHUB_TOKEN_VALUE}" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    printf 'export GITHUB_TOKEN="%s"\n' "${ESCAPED_GITHUB_TOKEN}" >>"$ENV_FILE"
+fi
+if [[ -n "${BOT_UPDATE_BRANCH_VALUE}" ]]; then
+    ESCAPED_UPDATE_BRANCH=$(printf '%s' "${BOT_UPDATE_BRANCH_VALUE}" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    printf 'export BOT_UPDATE_BRANCH="%s"\n' "${ESCAPED_UPDATE_BRANCH}" >>"$ENV_FILE"
+fi
 
 chmod 600 "$ENV_FILE"
 
-echo "Готово. Для запуска укажите переменную окружения DB_PATH=$DB_TARGET"
-echo "Пример: DB_PATH=$DB_TARGET ${INSTALL_DIR}/.venv/bin/python PII_BOT.py"
+echo "Готово. Для запуска укажите переменную окружения DB_PATH=$DB_PATH_VALUE"
+echo "Пример: DB_PATH=$DB_PATH_VALUE ${INSTALL_DIR}/.venv/bin/python PII_BOT.py"
 echo "Можно также загрузить переменные командой: source $ENV_FILE"
