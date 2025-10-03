@@ -28,6 +28,23 @@ DATA_DIR="/var/lib/pii_bot"
 INSTALL_DEPS=1
 APT_UPDATED=0
 
+sanitize_env_var() {
+    local name="$1"
+    name=$(echo "$name" | tr '[:lower:]' '[:upper:]')
+    name=$(echo "$name" | sed 's/[^A-Z0-9_]/_/g')
+    name=$(echo "$name" | sed 's/_\{2,\}/_/g')
+    while [[ "$name" == _* ]]; do
+        name="${name#_}"
+    done
+    if [[ -z "$name" ]]; then
+        name="PII_BOT_DISCORD_TOKEN"
+    fi
+    if [[ $name =~ ^[0-9] ]]; then
+        name="_${name}"
+    fi
+    printf '%s' "$name"
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --repo)
@@ -127,5 +144,49 @@ else
     fi
 fi
 
+BASENAME_ENV=$(sanitize_env_var "$(basename "$INSTALL_DIR")")
+if [[ -z "$BASENAME_ENV" ]]; then
+    BASENAME_ENV="PII_BOT"
+fi
+DEFAULT_ENV_NAME=$(sanitize_env_var "${BASENAME_ENV}_DISCORD_TOKEN")
+
+echo -n "Введите Discord-токен бота: "
+read -r -s DISCORD_TOKEN_VALUE
+echo
+while [[ -z "${DISCORD_TOKEN_VALUE}" ]]; do
+    echo -n "Токен не может быть пустым. Повторите ввод: "
+    read -r -s DISCORD_TOKEN_VALUE
+    echo
+done
+
+read -r -p "Имя переменной окружения для токена [$DEFAULT_ENV_NAME]: " TOKEN_ENV_NAME
+if [[ -z "${TOKEN_ENV_NAME}" ]]; then
+    TOKEN_ENV_NAME="$DEFAULT_ENV_NAME"
+fi
+
+SANITIZED_TOKEN_ENV=$(sanitize_env_var "$TOKEN_ENV_NAME")
+if [[ "$SANITIZED_TOKEN_ENV" != "$TOKEN_ENV_NAME" ]]; then
+    echo "Имя переменной скорректировано до $SANITIZED_TOKEN_ENV для совместимости со стандартом POSIX."
+fi
+TOKEN_ENV_NAME="$SANITIZED_TOKEN_ENV"
+
+ENV_FILE="$INSTALL_DIR/.env"
+echo "Записываю переменные окружения в $ENV_FILE"
+if [[ -f "$ENV_FILE" ]]; then
+    BACKUP_FILE="$ENV_FILE.bak.$(date +%s)"
+    cp "$ENV_FILE" "$BACKUP_FILE"
+    echo "Существующий файл сохранён как $BACKUP_FILE"
+fi
+
+cat >"$ENV_FILE" <<ENVFILE
+# Автоматически создано install.sh $(date -u +%Y-%m-%dT%H:%M:%SZ)
+export ${TOKEN_ENV_NAME}="${DISCORD_TOKEN_VALUE}"
+export PII_BOT_TOKEN_ENV="${TOKEN_ENV_NAME}"
+export DB_PATH="${DB_TARGET}"
+ENVFILE
+
+chmod 600 "$ENV_FILE"
+
 echo "Готово. Для запуска укажите переменную окружения DB_PATH=$DB_TARGET"
 echo "Пример: DB_PATH=$DB_TARGET ${INSTALL_DIR}/.venv/bin/python PII_BOT.py"
+echo "Можно также загрузить переменные командой: source $ENV_FILE"
