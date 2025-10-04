@@ -957,14 +957,9 @@ def upsert_assignments(conn: sqlite3.Connection, pos_id: int, assignments: List[
 def format_discord_response(assignments: List[Assignment]) -> str:
     if not assignments:
         return "_Ничего не подобрано._"
-    lines = [f"Всего назначений: **{len(assignments)}**"]
+    lines = []
     for i, a in enumerate(assignments, 1):
-        total_rate = a.rate * a.drills
-        tail = f" · ≈ {a.isk_per_hour:,.0f} ISK/h".replace(",", " ") if a.isk_per_hour else ""
-        lines.append(
-            f"{i}. {a.system} · {a.planet_name} · **{a.resource}** · drills={a.drills} · "
-            f"base={a.base_out:.2f}/h/bore → **{total_rate:,.2f}/ч**{tail}".replace(",", " ")
-        )
+        lines.append(f"{i}. {a.system} · {a.planet_name} — **{a.resource}**")
     return "\n".join(lines)
 
 def compute_pos_assignments(
@@ -1016,18 +1011,27 @@ def build_pos_assignment_message(
         return f"{label} (обновлено {ts})" if ts else label
 
     assignment_text = format_discord_response(assignments)
-    return (
-        f"✅ POS **{name}** ({system}, {constellation}) обновлён.\n"
-        f"Слотов: **{slots_val}** ({format_source(slots_override)}), "
-        f"буров/планету: **{drills_val}** ({format_source(drills_override)}).\n"
-        f"Расчёт целей: **цели − склад − текущая добыча**.\n\n"
-        f"Назначения для POS в **{system}** (ед/час):\n"
-        f"{assignment_text}"
-    )
+    header_lines = [
+        f"✅ POS **{name}** обновлён.",
+        f"{system}, {constellation}",
+        "",
+    ]
+    footer_lines = [
+        "Список планет:",
+        assignment_text,
+    ]
+    if slots_override or drills_override:
+        overrides = []
+        if slots_override:
+            overrides.append(f"слоты: {slots_val} ({format_source(True)})")
+        if drills_override:
+            overrides.append(f"буры: {drills_val} ({format_source(True)})")
+        header_lines.insert(1, ", ".join(overrides))
+    return "\n".join([line for line in header_lines + footer_lines if line is not None])
 
 
 def split_pos_assignment_message(full_message: str) -> Tuple[str, str]:
-    marker = "Назначения для POS"
+    marker = "Список планет:"
     idx = full_message.find(marker)
     if idx == -1:
         return full_message, ""
@@ -3824,6 +3828,146 @@ async def posstats_cmd(interaction: discord.Interaction):
     finally:
         conn.close()
 
+
+@tree.command(
+    name="posresstats",
+    description="Статистика по ресурсам в назначениях POS (только для администраторов).",
+)
+async def posresstats_cmd(interaction: discord.Interaction):
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("Только в сервере.", ephemeral=should_use_ephemeral(interaction))
+        return
+    if not is_admin_user(interaction):
+        await interaction.response.send_message(
+            "⛔ Команда доступна только администраторам сервера.",
+            ephemeral=should_use_ephemeral(interaction),
+        )
+        return
+
+    await interaction.response.defer(ephemeral=should_use_ephemeral(interaction))
+    conn = ensure_db_ready()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT
+                COALESCE(NULLIF(TRIM(pp.resource), ''), '— не задано —') AS resource,
+                COUNT(*) AS c
+            FROM pos_planet pp
+            INNER JOIN pos p ON p.id = pp.pos_id
+            WHERE p.guild_id=?
+            GROUP BY resource
+            ORDER BY c DESC, LOWER(resource)
+            """,
+            (guild.id,),
+        )
+        rows = cur.fetchall()
+        if not rows:
+            await interaction.followup.send(
+                "Назначений POS пока нет.",
+                ephemeral=should_use_ephemeral(interaction),
+            )
+            return
+
+        total_assigns = sum(int(r["c"]) for r in rows)
+        unique_resources = len(rows)
+        lines = [f"- {r['resource']}: {int(r['c'])}" for r in rows[:25]]
+        if len(rows) > 25:
+            lines.append(f"… и ещё {len(rows) - 25} ресурсов.")
+
+        summary = [
+            f"**Всего назначений:** {total_assigns}",
+            f"**Ресурсов:** {unique_resources}",
+            "",
+            "**Топ ресурсов:**",
+            "\n".join(lines),
+        ]
+        await interaction.followup.send(
+            "\n".join(summary),
+            ephemeral=should_use_ephemeral(interaction),
+        )
+    except Exception as e:
+        logger.exception("posresstats error: %s", e)
+        await interaction.followup.send(
+            f"Ошибка: {e}",
+            ephemeral=should_use_ephemeral(interaction),
+        )
+    finally:
+        conn.close()
+
+
+@tree.command(
+    name="possystemstats",
+    description="Статистика по системам в назначениях POS (только для администраторов).",
+)
+async def possystemstats_cmd(interaction: discord.Interaction):
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("Только в сервере.", ephemeral=should_use_ephemeral(interaction))
+        return
+    if not is_admin_user(interaction):
+        await interaction.response.send_message(
+            "⛔ Команда доступна только администраторам сервера.",
+            ephemeral=should_use_ephemeral(interaction),
+        )
+        return
+
+    await interaction.response.defer(ephemeral=should_use_ephemeral(interaction))
+    conn = ensure_db_ready()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT
+                COALESCE(NULLIF(TRIM(pr.system), ''), '— не определена —') AS system,
+                COUNT(*) AS c
+            FROM pos_planet pp
+            INNER JOIN pos p ON p.id = pp.pos_id
+            LEFT JOIN planet_resources pr
+              ON (CASE WHEN typeof(pr.planet_id)='integer' AND pr.planet_id>0
+                       THEN pr.planet_id ELSE pr.rowid END) = pp.planet_id
+            WHERE p.guild_id=?
+            GROUP BY system
+            ORDER BY c DESC, LOWER(system)
+            """,
+            (guild.id,),
+        )
+        rows = cur.fetchall()
+        if not rows:
+            await interaction.followup.send(
+                "Назначений POS пока нет.",
+                ephemeral=should_use_ephemeral(interaction),
+            )
+            return
+
+        total_assigns = sum(int(r["c"]) for r in rows)
+        unique_systems = len(rows)
+        lines = [f"- {r['system']}: {int(r['c'])}" for r in rows[:25]]
+        if len(rows) > 25:
+            lines.append(f"… и ещё {len(rows) - 25} систем.")
+
+        summary = [
+            f"**Всего назначений:** {total_assigns}",
+            f"**Систем:** {unique_systems}",
+            "",
+            "**Топ систем:**",
+            "\n".join(lines),
+        ]
+        await interaction.followup.send(
+            "\n".join(summary),
+            ephemeral=should_use_ephemeral(interaction),
+        )
+    except Exception as e:
+        logger.exception("possystemstats error: %s", e)
+        await interaction.followup.send(
+            f"Ошибка: {e}",
+            ephemeral=should_use_ephemeral(interaction),
+        )
+    finally:
+        conn.close()
+
+
 # --- Обновление бота из Discord ---
 @tree.command(name="updatebot", description="Обновить код бота из GitHub (только для администраторов).")
 @app_commands.describe(
@@ -3936,13 +4080,9 @@ async def myassigns_cmd(interaction: discord.Interaction, pos_id: Optional[int] 
                 lines.append("  _Назначений нет._")
                 continue
             for r in arows:
-                total_rate = float(r["rate"]) * int(r["drills_count"])
                 sys = r["pr_system"] or "?"
                 planet = r["pr_planet"] or f"#{r['planet_id']}"
-                lines.append(
-                    f"- {sys} · {planet} · **{r['resource']}** · drills={r['drills_count']} · "
-                    f"base={float(r['rate']):.2f}/h/bore → **{total_rate:,.2f}/ч**".replace(",", " ")
-                )
+                lines.append(f"- {sys} · {planet} — **{r['resource']}**")
             lines.append("")
         await send_long(interaction, "\n".join(lines), ephemeral=should_use_ephemeral(interaction), title="Мои назначения")
     except Exception as e:
