@@ -42,6 +42,7 @@ DB_PATH=/var/lib/pii_bot/planets.db /opt/pii_bot/.venv/bin/python PII_BOT.py
 | `DB_PATH` | Путь к файлу базы данных SQLite | `planets.db` |
 | `LOG_DIR` | Каталог для файлов логов | `logs` |
 | `LOG_LEVEL` | Уровень логирования (`DEBUG`, `INFO`, …) | `INFO` |
+| `ALLOW_EPHEMERAL_RESPONSES` | Включить ли ответы, видимые только вызывающему | `false` |
 | `PII_BOT_TOKEN_ENV` | Имя переменной с токеном Discord | `DISCORD_TOKEN` |
 | `DEFAULT_SLOTS` | Слоты планет для POS по умолчанию | `10` |
 | `DEFAULT_DRILLS` | Количество буров на планету по умолчанию | `22` |
@@ -59,7 +60,7 @@ DB_PATH=/var/lib/pii_bot/planets.db /opt/pii_bot/.venv/bin/python PII_BOT.py
 
 ### Настройки `/posdefaults`
 
-Позволяют хранить значения по умолчанию для команд, связанных с POS. Все ответы приходят личным сообщением (ephemeral).
+Позволяют хранить значения по умолчанию для команд, связанных с POS. По умолчанию ответы видны всем, но приватный режим можно вернуть, установив `ALLOW_EPHEMERAL_RESPONSES=true`.
 
 - `/posdefaults setguild slots:<число> drills:<число>` — задаёт стандартные значения слотов и буров для всего сервера. Требуются права администратора.
 - `/posdefaults set slots:<число> drills:<число>` — сохраняет личные значения пользователя для текущего сервера.

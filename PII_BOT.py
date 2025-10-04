@@ -94,6 +94,24 @@ fh = logging.FileHandler(log_filename, encoding="utf-8"); fh.setLevel(LOG_LEVEL)
 logger.addHandler(ch); logger.addHandler(fh)
 logger.info("=== Bot started, log file: %s ===", log_filename)
 
+# ==================== ЭФЕМЕРНЫЕ СООБЩЕНИЯ ====================
+ALLOW_EPHEMERAL_RESPONSES = os.getenv("ALLOW_EPHEMERAL_RESPONSES", "false").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
+
+def should_use_ephemeral(interaction: Optional[discord.Interaction]) -> bool:
+    """Возвращает, нужно ли отправлять ответ как ephemeral."""
+
+    if not ALLOW_EPHEMERAL_RESPONSES:
+        return False
+    if interaction is None:
+        return False
+    return interaction.guild is not None
+
 # ==================== ХЕЛПЕРЫ ====================
 def now_utc_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
@@ -1023,7 +1041,7 @@ class RefreshPosModal(discord.ui.Modal):
         self.add_item(self.drills_input)
 
     async def on_submit(self, interaction: discord.Interaction):
-        ephemeral = interaction.guild is not None
+        ephemeral = should_use_ephemeral(interaction)
         await interaction.response.defer(thinking=True, ephemeral=ephemeral)
 
         conn = ensure_db_ready()
@@ -1181,7 +1199,7 @@ class PosUpdateAckButton(discord.ui.Button):
             if not row:
                 await interaction.response.send_message(
                     "POS не найден (возможно, удалён).",
-                    ephemeral=True,
+                    ephemeral=should_use_ephemeral(interaction),
                 )
                 return
 
@@ -1189,7 +1207,7 @@ class PosUpdateAckButton(discord.ui.Button):
             if owner_id != interaction.user.id:
                 await interaction.response.send_message(
                     "⛔ Отметить обновление может только владелец POS.",
-                    ephemeral=True,
+                    ephemeral=should_use_ephemeral(interaction),
                 )
                 return
 
@@ -1208,7 +1226,7 @@ class PosUpdateAckButton(discord.ui.Button):
             logger.exception("Не удалось сохранить отметку обновления POS %s: %s", self.pos_id, e)
             await interaction.response.send_message(
                 "Ошибка при сохранении отметки. Попробуй позже.",
-                ephemeral=True,
+                ephemeral=should_use_ephemeral(interaction),
             )
             return
         finally:
@@ -1789,7 +1807,7 @@ class ResourceSubmitButton(discord.ui.Button):
     async def callback(self, interaction: discord.Interaction):
         if interaction.user.bot:
             return
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer(ephemeral=should_use_ephemeral(interaction))
 
         conn = ensure_db_ready()
         already = False
@@ -1809,14 +1827,14 @@ class ResourceSubmitButton(discord.ui.Button):
             ) = record_ping_submission(cur, self.ping_id, interaction.user.id)
             conn.commit()
         except PingNotFoundError:
-            await interaction.followup.send("Напоминание больше не доступно.", ephemeral=True)
+            await interaction.followup.send("Напоминание больше не доступно.", ephemeral=should_use_ephemeral(interaction))
             return
         except PingInactiveError:
-            await interaction.followup.send("Это напоминание уже закрыто.", ephemeral=True)
+            await interaction.followup.send("Это напоминание уже закрыто.", ephemeral=should_use_ephemeral(interaction))
             return
         except Exception as e:
             logger.exception("resource_ping submit error: %s", e)
-            await interaction.followup.send(f"Ошибка: {e}", ephemeral=True)
+            await interaction.followup.send(f"Ошибка: {e}", ephemeral=should_use_ephemeral(interaction))
             return
         finally:
             conn.close()
@@ -1857,7 +1875,7 @@ class ResourceSubmitButton(discord.ui.Button):
                 info = "✅ Отметил сдачу. Спасибо!"
         if total_pos > 0:
             info += f"\nПокрытие POS по напоминанию: {submitted_pos}/{total_pos}."
-        await interaction.followup.send(info, ephemeral=True)
+        await interaction.followup.send(info, ephemeral=should_use_ephemeral(interaction))
 
 class ResourcePingView(discord.ui.View):
     def __init__(self, ping_id: int):
@@ -1958,16 +1976,16 @@ def _validate_default_bounds(value: int, kind: str) -> Optional[str]:
 async def posdefaults_setguild(interaction: discord.Interaction, slots: int, drills: int):
     guild = interaction.guild
     if not guild:
-        await interaction.response.send_message("Только в сервере.", ephemeral=True)
+        await interaction.response.send_message("Только в сервере.", ephemeral=should_use_ephemeral(interaction))
         return
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.defer(ephemeral=should_use_ephemeral(interaction))
     if not is_admin_user(interaction):
-        await interaction.followup.send("⛔ Команда доступна только администраторам сервера.", ephemeral=True)
+        await interaction.followup.send("⛔ Команда доступна только администраторам сервера.", ephemeral=should_use_ephemeral(interaction))
         return
 
     err = _validate_default_bounds(int(slots), "slots") or _validate_default_bounds(int(drills), "drills")
     if err:
-        await interaction.followup.send(err, ephemeral=True)
+        await interaction.followup.send(err, ephemeral=should_use_ephemeral(interaction))
         return
 
     conn = ensure_db_ready()
@@ -1976,11 +1994,11 @@ async def posdefaults_setguild(interaction: discord.Interaction, slots: int, dri
         report = build_pos_defaults_report(conn, guild.id, interaction.user.id)
         await interaction.followup.send(
             "✅ Значения по умолчанию для сервера обновлены.\n" + report,
-            ephemeral=True,
+            ephemeral=should_use_ephemeral(interaction),
         )
     except Exception as e:
         logger.exception("posdefaults_setguild error: %s", e)
-        await interaction.followup.send(f"Ошибка: {e}", ephemeral=True)
+        await interaction.followup.send(f"Ошибка: {e}", ephemeral=should_use_ephemeral(interaction))
     finally:
         conn.close()
 
@@ -1989,13 +2007,13 @@ async def posdefaults_setguild(interaction: discord.Interaction, slots: int, dri
 async def posdefaults_setuser(interaction: discord.Interaction, slots: int, drills: int):
     guild = interaction.guild
     if not guild:
-        await interaction.response.send_message("Только в сервере.", ephemeral=True)
+        await interaction.response.send_message("Только в сервере.", ephemeral=should_use_ephemeral(interaction))
         return
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.defer(ephemeral=should_use_ephemeral(interaction))
 
     err = _validate_default_bounds(int(slots), "slots") or _validate_default_bounds(int(drills), "drills")
     if err:
-        await interaction.followup.send(err, ephemeral=True)
+        await interaction.followup.send(err, ephemeral=should_use_ephemeral(interaction))
         return
 
     conn = ensure_db_ready()
@@ -2004,11 +2022,11 @@ async def posdefaults_setuser(interaction: discord.Interaction, slots: int, dril
         report = build_pos_defaults_report(conn, guild.id, interaction.user.id)
         await interaction.followup.send(
             "✅ Личные значения по умолчанию сохранены.\n" + report,
-            ephemeral=True,
+            ephemeral=should_use_ephemeral(interaction),
         )
     except Exception as e:
         logger.exception("posdefaults_setuser error: %s", e)
-        await interaction.followup.send(f"Ошибка: {e}", ephemeral=True)
+        await interaction.followup.send(f"Ошибка: {e}", ephemeral=should_use_ephemeral(interaction))
     finally:
         conn.close()
 
@@ -2016,19 +2034,19 @@ async def posdefaults_setuser(interaction: discord.Interaction, slots: int, dril
 async def posdefaults_clear(interaction: discord.Interaction):
     guild = interaction.guild
     if not guild:
-        await interaction.response.send_message("Только в сервере.", ephemeral=True)
+        await interaction.response.send_message("Только в сервере.", ephemeral=should_use_ephemeral(interaction))
         return
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.defer(ephemeral=should_use_ephemeral(interaction))
 
     conn = ensure_db_ready()
     try:
         removed = clear_user_pos_defaults(conn, guild.id, interaction.user.id)
         report = build_pos_defaults_report(conn, guild.id, interaction.user.id)
         head = "🧹 Личные значения удалены." if removed else "ℹ️ Личные значения не были заданы."
-        await interaction.followup.send(head + "\n" + report, ephemeral=True)
+        await interaction.followup.send(head + "\n" + report, ephemeral=should_use_ephemeral(interaction))
     except Exception as e:
         logger.exception("posdefaults_clear error: %s", e)
-        await interaction.followup.send(f"Ошибка: {e}", ephemeral=True)
+        await interaction.followup.send(f"Ошибка: {e}", ephemeral=should_use_ephemeral(interaction))
     finally:
         conn.close()
 
@@ -2036,17 +2054,17 @@ async def posdefaults_clear(interaction: discord.Interaction):
 async def posdefaults_show(interaction: discord.Interaction):
     guild = interaction.guild
     if not guild:
-        await interaction.response.send_message("Только в сервере.", ephemeral=True)
+        await interaction.response.send_message("Только в сервере.", ephemeral=should_use_ephemeral(interaction))
         return
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.defer(ephemeral=should_use_ephemeral(interaction))
 
     conn = ensure_db_ready()
     try:
         report = build_pos_defaults_report(conn, guild.id, interaction.user.id)
-        await interaction.followup.send(report, ephemeral=True)
+        await interaction.followup.send(report, ephemeral=should_use_ephemeral(interaction))
     except Exception as e:
         logger.exception("posdefaults_show error: %s", e)
-        await interaction.followup.send(f"Ошибка: {e}", ephemeral=True)
+        await interaction.followup.send(f"Ошибка: {e}", ephemeral=should_use_ephemeral(interaction))
     finally:
         conn.close()
 
@@ -2071,14 +2089,14 @@ async def resping_ping(
 ):
     guild = interaction.guild
     if not guild:
-        await interaction.response.send_message("Только в сервере.", ephemeral=True)
+        await interaction.response.send_message("Только в сервере.", ephemeral=should_use_ephemeral(interaction))
         return
     if not is_admin_user(interaction):
-        await interaction.response.send_message("⛔ Команда доступна только администраторам сервера.", ephemeral=True)
+        await interaction.response.send_message("⛔ Команда доступна только администраторам сервера.", ephemeral=should_use_ephemeral(interaction))
         return
     channel = interaction.channel
     if channel is None or not hasattr(channel, "send"):
-        await interaction.response.send_message("Не удалось определить канал для отправки сообщения.", ephemeral=True)
+        await interaction.response.send_message("Не удалось определить канал для отправки сообщения.", ephemeral=should_use_ephemeral(interaction))
         return
 
     bot_user = interaction.client.user if interaction.client else None
@@ -2108,7 +2126,7 @@ async def resping_ping(
     if fallback_identity is None:
         await interaction.response.send_message(
             "Не удалось определить права бота на сервере. Проверьте, что бот добавлен на сервер.",
-            ephemeral=True,
+            ephemeral=should_use_ephemeral(interaction),
         )
         return
 
@@ -2142,19 +2160,19 @@ async def resping_ping(
         missing_text = ", ".join(sorted(set(missing_permissions)))
         await interaction.response.send_message(
             f"⛔ У бота нет необходимых прав для отправки напоминания в этом канале: {missing_text}.",
-            ephemeral=True,
+            ephemeral=should_use_ephemeral(interaction),
         )
         return
 
     body = (text or "").strip()
     if not body:
-        await interaction.response.send_message("Текст напоминания не должен быть пустым.", ephemeral=True)
+        await interaction.response.send_message("Текст напоминания не должен быть пустым.", ephemeral=should_use_ephemeral(interaction))
         return
     if len(body) > 2000:
-        await interaction.response.send_message("Текст напоминания слишком длинный (максимум 2000 символов).", ephemeral=True)
+        await interaction.response.send_message("Текст напоминания слишком длинный (максимум 2000 символов).", ephemeral=should_use_ephemeral(interaction))
         return
 
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.defer(ephemeral=should_use_ephemeral(interaction))
 
     conn = ensure_db_ready()
     try:
@@ -2177,7 +2195,7 @@ async def resping_ping(
         conn.commit()
     except Exception as e:
         logger.exception("resping_ping insert error: %s", e)
-        await interaction.followup.send(f"Ошибка: {e}", ephemeral=True)
+        await interaction.followup.send(f"Ошибка: {e}", ephemeral=should_use_ephemeral(interaction))
         return
     finally:
         conn.close()
@@ -2217,7 +2235,7 @@ async def resping_ping(
             cleanup_conn.commit()
         finally:
             cleanup_conn.close()
-        await interaction.followup.send(f"Не удалось отправить сообщение: {e}", ephemeral=True)
+        await interaction.followup.send(f"Не удалось отправить сообщение: {e}", ephemeral=should_use_ephemeral(interaction))
         return
 
     conn = ensure_db_ready()
@@ -2306,7 +2324,7 @@ async def resping_ping(
         failed_mentions = ", ".join(f"<@{uid}>" for uid in failed)
         summary_lines.append("Не удалось отправить DM: " + failed_mentions)
 
-    await interaction.followup.send("\n".join(summary_lines), ephemeral=True)
+    await interaction.followup.send("\n".join(summary_lines), ephemeral=should_use_ephemeral(interaction))
 
 
 def resolve_active_ping_for_user(
@@ -2369,7 +2387,7 @@ def resolve_active_ping_for_user(
 async def resping_submit(interaction: discord.Interaction, data: Optional[str] = None):
     guild = interaction.guild
     if not guild:
-        await interaction.response.send_message("Только в сервере.", ephemeral=True)
+        await interaction.response.send_message("Только в сервере.", ephemeral=should_use_ephemeral(interaction))
         return
 
     channel = interaction.channel
@@ -2404,12 +2422,12 @@ async def resping_submit(interaction: discord.Interaction, data: Optional[str] =
                     "На сервере есть несколько активных напоминаний, по которым ты ещё не отметился: "
                     + listed
                     + ". Запусти команду из ветки нужного напоминания или отметься кнопкой \"Сдал\".",
-                    ephemeral=True,
+                    ephemeral=should_use_ephemeral(interaction),
                 )
             else:
                 await interaction.response.send_message(
                     "Нет активных напоминаний, к которым можно отправить отчёт.",
-                    ephemeral=True,
+                    ephemeral=should_use_ephemeral(interaction),
                 )
             return
 
@@ -2418,7 +2436,7 @@ async def resping_submit(interaction: discord.Interaction, data: Optional[str] =
             if not items:
                 await interaction.response.send_message(
                     "Не удалось распарсить данные. Проверь колонки/формат.",
-                    ephemeral=True,
+                    ephemeral=should_use_ephemeral(interaction),
                 )
                 return
 
@@ -2450,7 +2468,7 @@ async def resping_submit(interaction: discord.Interaction, data: Optional[str] =
                 pretty = ", ".join(sorted(set(invalid_amounts)))
                 await interaction.response.send_message(
                     f"Количество не может быть отрицательным. Проверь: {pretty}.",
-                    ephemeral=True,
+                    ephemeral=should_use_ephemeral(interaction),
                 )
                 return
 
@@ -2459,7 +2477,7 @@ async def resping_submit(interaction: discord.Interaction, data: Optional[str] =
             entry["unit_price"] = sum(prices) / len(prices) if prices else None
             entry.pop("prices", None)
 
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer(ephemeral=should_use_ephemeral(interaction))
 
         cur = conn.cursor()
         cur.execute(
@@ -2470,7 +2488,7 @@ async def resping_submit(interaction: discord.Interaction, data: Optional[str] =
         if not ping_row:
             raise PingNotFoundError(f"Ping {ping_id} not found")
         if int(ping_row["guild_id"]) != guild.id:
-            await interaction.followup.send("Это напоминание относится к другому серверу.", ephemeral=True)
+            await interaction.followup.send("Это напоминание относится к другому серверу.", ephemeral=should_use_ephemeral(interaction))
             return
 
         ping_content = ping_row["content"] or ""
@@ -2479,7 +2497,7 @@ async def resping_submit(interaction: discord.Interaction, data: Optional[str] =
         if not assignments:
             await interaction.followup.send(
                 "У тебя нет назначенных планет на этом сервере.",
-                ephemeral=True,
+                ephemeral=should_use_ephemeral(interaction),
             )
             return
 
@@ -2490,7 +2508,7 @@ async def resping_submit(interaction: discord.Interaction, data: Optional[str] =
                 "Эти ресурсы не закреплены за тобой: "
                 + ", ".join(unexpected)
                 + f". Доступные: {available}.",
-                ephemeral=True,
+                ephemeral=should_use_ephemeral(interaction),
             )
             return
 
@@ -2532,14 +2550,14 @@ async def resping_submit(interaction: discord.Interaction, data: Optional[str] =
         conn.commit()
         submission_saved = True
     except PingNotFoundError:
-        await interaction.followup.send("Напоминание не найдено.", ephemeral=True)
+        await interaction.followup.send("Напоминание не найдено.", ephemeral=should_use_ephemeral(interaction))
         return
     except PingInactiveError:
-        await interaction.followup.send("Это напоминание уже закрыто.", ephemeral=True)
+        await interaction.followup.send("Это напоминание уже закрыто.", ephemeral=should_use_ephemeral(interaction))
         return
     except Exception as e:
         logger.exception("resping_submit error: %s", e)
-        await interaction.followup.send(f"Ошибка: {e}", ephemeral=True)
+        await interaction.followup.send(f"Ошибка: {e}", ephemeral=should_use_ephemeral(interaction))
         return
     finally:
         conn.close()
@@ -2608,7 +2626,7 @@ async def resping_submit(interaction: discord.Interaction, data: Optional[str] =
 
     summary_lines.append("ℹ️ " + ("Время сдачи обновлено." if already else "Сдача сохранена."))
 
-    await interaction.followup.send("\n".join(summary_lines), ephemeral=True)
+    await interaction.followup.send("\n".join(summary_lines), ephemeral=should_use_ephemeral(interaction))
 
 
 @resping_group.command(name="stats", description="Показать статистику отметок за период.")
@@ -2623,10 +2641,10 @@ async def resping_stats(
 ):
     guild = interaction.guild
     if not guild:
-        await interaction.response.send_message("Только в сервере.", ephemeral=True)
+        await interaction.response.send_message("Только в сервере.", ephemeral=should_use_ephemeral(interaction))
         return
 
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.defer(ephemeral=should_use_ephemeral(interaction))
 
     days_val = int(days or 7)
     if days_val < 1:
@@ -2653,7 +2671,7 @@ async def resping_stats(
             )
             ping_info = cur.fetchone()
             if not ping_info:
-                await interaction.followup.send("Напоминание с таким ID не найдено на этом сервере.", ephemeral=True)
+                await interaction.followup.send("Напоминание с таким ID не найдено на этом сервере.", ephemeral=should_use_ephemeral(interaction))
                 return
 
         cur.execute(
@@ -2683,7 +2701,7 @@ async def resping_stats(
         ping_rows = cur.fetchall()
     except Exception as e:
         logger.exception("resping_stats error: %s", e)
-        await interaction.followup.send(f"Ошибка: {e}", ephemeral=True)
+        await interaction.followup.send(f"Ошибка: {e}", ephemeral=should_use_ephemeral(interaction))
         return
     finally:
         conn.close()
@@ -2733,7 +2751,7 @@ async def resping_stats(
             ping_lines.append(f"#{pid} — **{count}** отметок (последняя: {last_at})")
         embed.add_field(name="Напоминания", value="\n".join(ping_lines), inline=False)
 
-    await interaction.followup.send(embed=embed, ephemeral=True)
+    await interaction.followup.send(embed=embed, ephemeral=should_use_ephemeral(interaction))
 
 
 @resping_group.command(name="audit", description="Анализ сдачи ресурсов между отметками.")
@@ -2748,15 +2766,15 @@ async def resping_audit(
 ):
     guild = interaction.guild
     if not guild:
-        await interaction.response.send_message("Только в сервере.", ephemeral=True)
+        await interaction.response.send_message("Только в сервере.", ephemeral=should_use_ephemeral(interaction))
         return
     if not is_admin_user(interaction):
         await interaction.response.send_message(
-            "⛔ Команда доступна только администраторам сервера.", ephemeral=True
+            "⛔ Команда доступна только администраторам сервера.", ephemeral=should_use_ephemeral(interaction)
         )
         return
 
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.defer(ephemeral=should_use_ephemeral(interaction))
 
     days_val = int(days or 7)
     if days_val < 1:
@@ -2780,14 +2798,14 @@ async def resping_audit(
         stats, intervals, extras = compute_resping_delivery_audit(conn, guild.id, since_iso)
     except Exception as e:
         logger.exception("resping_audit error: %s", e)
-        await interaction.followup.send(f"Ошибка: {e}", ephemeral=True)
+        await interaction.followup.send(f"Ошибка: {e}", ephemeral=should_use_ephemeral(interaction))
         return
     finally:
         conn.close()
 
     if not stats:
         await interaction.followup.send(
-            "Нет данных о сдаче ресурсов за выбранный период.", ephemeral=True
+            "Нет данных о сдаче ресурсов за выбранный период.", ephemeral=should_use_ephemeral(interaction)
         )
         return
 
@@ -2802,7 +2820,7 @@ async def resping_audit(
 
     if not user_entries:
         await interaction.followup.send(
-            "Недостаточно данных о сдаче ресурсов за выбранный период.", ephemeral=True
+            "Недостаточно данных о сдаче ресурсов за выбранный период.", ephemeral=should_use_ephemeral(interaction)
         )
         return
 
@@ -2880,7 +2898,7 @@ async def resping_audit(
     await send_long(
         interaction,
         text,
-        ephemeral=True,
+        ephemeral=should_use_ephemeral(interaction),
         title="Аудит сдачи ресурсов",
     )
 
@@ -3133,10 +3151,10 @@ async def resource_reminder_loop():
 async def setneed_cmd(interaction: discord.Interaction, resource: str, amount: float):
     guild = interaction.guild
     if not guild:
-        await interaction.response.send_message("Только в сервере.", ephemeral=True); return
+        await interaction.response.send_message("Только в сервере.", ephemeral=should_use_ephemeral(interaction)); return
     res = clean_resource_name(resource)
     if amount < 0:
-        await interaction.response.send_message("amount должен быть >= 0.", ephemeral=True); return
+        await interaction.response.send_message("amount должен быть >= 0.", ephemeral=should_use_ephemeral(interaction)); return
     conn = ensure_db_ready()
     try:
         cur = conn.cursor()
@@ -3152,7 +3170,7 @@ async def setneed_cmd(interaction: discord.Interaction, resource: str, amount: f
         )
     except Exception as e:
         logger.exception("setneed error: %s", e)
-        await interaction.response.send_message(f"Ошибка: {e}", ephemeral=True)
+        await interaction.response.send_message(f"Ошибка: {e}", ephemeral=should_use_ephemeral(interaction))
     finally:
         conn.close()
 
@@ -3160,7 +3178,7 @@ async def setneed_cmd(interaction: discord.Interaction, resource: str, amount: f
 async def clearneeds_cmd(interaction: discord.Interaction):
     guild = interaction.guild
     if not guild:
-        await interaction.response.send_message("Только в сервере.", ephemeral=True); return
+        await interaction.response.send_message("Только в сервере.", ephemeral=should_use_ephemeral(interaction)); return
     conn = ensure_db_ready()
     try:
         cur = conn.cursor()
@@ -3170,7 +3188,7 @@ async def clearneeds_cmd(interaction: discord.Interaction):
         await interaction.response.send_message(f"Удалено целей: **{n}**.", ephemeral=False)
     except Exception as e:
         logger.exception("clearneeds error: %s", e)
-        await interaction.response.send_message(f"Ошибка: {e}", ephemeral=True)
+        await interaction.response.send_message(f"Ошибка: {e}", ephemeral=should_use_ephemeral(interaction))
     finally:
         conn.close()
 
@@ -3180,7 +3198,7 @@ async def clearneeds_cmd(interaction: discord.Interaction):
 async def eta_cmd(interaction: discord.Interaction, resource: Optional[str] = None, limit: Optional[int] = 20):
     guild = interaction.guild
     if not guild:
-        await interaction.response.send_message("Только в сервере.", ephemeral=True); return
+        await interaction.response.send_message("Только в сервере.", ephemeral=should_use_ephemeral(interaction)); return
     await interaction.response.defer(ephemeral=False)
     conn = ensure_db_ready()
     try:
@@ -3203,7 +3221,7 @@ async def eta_cmd(interaction: discord.Interaction, resource: Optional[str] = No
             res = clean_resource_name(resource)
             amount_total = needs.get(res)
             if amount_total is None:
-                await interaction.followup.send(f"Для **{res}** цель не задана.", ephemeral=True); return
+                await interaction.followup.send(f"Для **{res}** цель не задана.", ephemeral=should_use_ephemeral(interaction)); return
             left = needs_left.get(res, 0.0)
             eta_txt, _ = fmt(left, rph.get(res, 0.0))
             lines.append(
@@ -3230,7 +3248,7 @@ async def eta_cmd(interaction: discord.Interaction, resource: Optional[str] = No
         await send_long(interaction, header + "\n" + "\n".join(lines), ephemeral=False, title="ETA")
     except Exception as e:
         logger.exception("eta error: %s", e)
-        await interaction.followup.send(f"Ошибка: {e}", ephemeral=True)
+        await interaction.followup.send(f"Ошибка: {e}", ephemeral=should_use_ephemeral(interaction))
     finally:
         conn.close()
 
@@ -3251,14 +3269,14 @@ async def isk_cmd(
 ):
     guild = interaction.guild
     if not guild:
-        await interaction.response.send_message("Только в сервере.", ephemeral=True); return
-    await interaction.response.defer(ephemeral=True)
+        await interaction.response.send_message("Только в сервере.", ephemeral=should_use_ephemeral(interaction)); return
+    await interaction.response.defer(ephemeral=should_use_ephemeral(interaction))
     conn = ensure_db_ready()
     try:
         act = action.value.lower()
         if act == "set":
             if not resource or price is None:
-                await interaction.followup.send("Нужно resource и price.", ephemeral=True); return
+                await interaction.followup.send("Нужно resource и price.", ephemeral=should_use_ephemeral(interaction)); return
             set_price(conn, resource, price)
             await interaction.followup.send(f"OK: **{clean_resource_name(resource)}** = **{price:.2f} ISK/ед**", ephemeral=False)
         elif act == "show":
@@ -3266,18 +3284,18 @@ async def isk_cmd(
                 p = get_price(conn, resource)
                 await interaction.followup.send(
                     f"**{clean_resource_name(resource)}** = **{p:.2f} ISK/ед**" if p is not None else "Цена не задана.",
-                    ephemeral=True
+                    ephemeral=should_use_ephemeral(interaction)
                 )
             else:
                 prices = get_prices(conn)
                 if not prices:
-                    await interaction.followup.send("Цены не заданы.", ephemeral=True)
+                    await interaction.followup.send("Цены не заданы.", ephemeral=should_use_ephemeral(interaction))
                 else:
                     lines = [f"- {r}: {v:.2f} ISK/ед" for r,v in sorted(prices.items())]
-                    await interaction.followup.send("**Цены (ISK/ед):**\n" + "\n".join(lines), ephemeral=True)
+                    await interaction.followup.send("**Цены (ISK/ед):**\n" + "\n".join(lines), ephemeral=should_use_ephemeral(interaction))
         elif act == "import":
             if not csv_prices:
-                await interaction.followup.send("Передай csv_prices: `resource,price` построчно.", ephemeral=True); return
+                await interaction.followup.send("Передай csv_prices: `resource,price` построчно.", ephemeral=should_use_ephemeral(interaction)); return
             import csv, io
             f = io.StringIO(csv_prices); reader = csv.reader(f); n=0
             for row in reader:
@@ -3286,12 +3304,12 @@ async def isk_cmd(
                 try: val = float(row[1])
                 except: continue
                 set_price(conn, res, val); n+=1
-            await interaction.followup.send(f"Импортировано: **{n}**.", ephemeral=True)
+            await interaction.followup.send(f"Импортировано: **{n}**.", ephemeral=should_use_ephemeral(interaction))
         else:
-            await interaction.followup.send("Неизвестное действие.", ephemeral=True)
+            await interaction.followup.send("Неизвестное действие.", ephemeral=should_use_ephemeral(interaction))
     except Exception as e:
         logger.exception("isk error: %s", e)
-        await interaction.followup.send(f"Ошибка: {e}", ephemeral=True)
+        await interaction.followup.send(f"Ошибка: {e}", ephemeral=should_use_ephemeral(interaction))
     finally:
         conn.close()
 
@@ -3434,17 +3452,17 @@ def upsert_have(conn: sqlite3.Connection, guild_id: int, items: List[Tuple[str, 
 async def have_cmd(interaction: discord.Interaction, action: app_commands.Choice[str], data: Optional[str] = None):
     guild = interaction.guild
     if not guild:
-        await interaction.response.send_message("Только в сервере.", ephemeral=True); return
-    await interaction.response.defer(ephemeral=True)
+        await interaction.response.send_message("Только в сервере.", ephemeral=should_use_ephemeral(interaction)); return
+    await interaction.response.defer(ephemeral=should_use_ephemeral(interaction))
     conn = ensure_db_ready()
     try:
         act = action.value.lower()
         if act == "import":
             if not data or not data.strip():
-                await interaction.followup.send("Вставь таблицу в параметр `data` (TSV/CSV или одной строкой).", ephemeral=True); return
+                await interaction.followup.send("Вставь таблицу в параметр `data` (TSV/CSV или одной строкой).", ephemeral=should_use_ephemeral(interaction)); return
             items = parse_have_table(data)
             if not items:
-                await interaction.followup.send("Не удалось распарсить данные. Проверь колонки/формат.", ephemeral=True); return
+                await interaction.followup.send("Не удалось распарсить данные. Проверь колонки/формат.", ephemeral=should_use_ephemeral(interaction)); return
             n = upsert_have(conn, guild.id, items)
 
             # Дополнительно запишем unit_price в isk_price (чтобы /isk show видел эти цены)
@@ -3461,7 +3479,7 @@ async def have_cmd(interaction: discord.Interaction, action: app_commands.Choice
             cur.execute("""SELECT resource, amount_units, unit_price FROM guild_have WHERE guild_id=? ORDER BY resource""", (guild.id,))
             rows = cur.fetchall()
             if not rows:
-                await interaction.followup.send("Склад пуст. Используй `/have import`.", ephemeral=True); return
+                await interaction.followup.send("Склад пуст. Используй `/have import`.", ephemeral=should_use_ephemeral(interaction)); return
             lines=[]
             for r in rows[:50]:
                 res = r["resource"]; amt = float(r["amount_units"]); up = r["unit_price"]
@@ -3475,12 +3493,12 @@ async def have_cmd(interaction: discord.Interaction, action: app_commands.Choice
             cur.execute("DELETE FROM guild_have WHERE guild_id=?", (guild.id,))
             n = cur.rowcount or 0
             conn.commit()
-            await interaction.followup.send(f"🧹 Очищено записей склада: **{n}**.", ephemeral=True)
+            await interaction.followup.send(f"🧹 Очищено записей склада: **{n}**.", ephemeral=should_use_ephemeral(interaction))
         else:
-            await interaction.followup.send("Неизвестное действие.", ephemeral=True)
+            await interaction.followup.send("Неизвестное действие.", ephemeral=should_use_ephemeral(interaction))
     except Exception as e:
         logger.exception("have error: %s", e)
-        await interaction.followup.send(f"Ошибка: {e}", ephemeral=True)
+        await interaction.followup.send(f"Ошибка: {e}", ephemeral=should_use_ephemeral(interaction))
     finally:
         conn.close()
 
@@ -3505,8 +3523,8 @@ async def addpos_cmd(
 ):
     guild = interaction.guild
     if not guild:
-        await interaction.response.send_message("Только в сервере.", ephemeral=True); return
-    await interaction.response.defer(ephemeral=True)
+        await interaction.response.send_message("Только в сервере.", ephemeral=should_use_ephemeral(interaction)); return
+    await interaction.response.defer(ephemeral=should_use_ephemeral(interaction))
 
     gid = guild.id
     uid = interaction.user.id
@@ -3522,12 +3540,12 @@ async def addpos_cmd(
 
         err = _validate_default_bounds(slots_val, "slots") or _validate_default_bounds(drills_val, "drills")
         if err:
-            await interaction.followup.send(err, ephemeral=True)
+            await interaction.followup.send(err, ephemeral=should_use_ephemeral(interaction))
             return
 
         constellation = find_constellation_by_system(conn, system)
         if not constellation:
-            await interaction.followup.send(f"Система **{system}** не найдена в базе.", ephemeral=True); return
+            await interaction.followup.send(f"Система **{system}** не найдена в базе.", ephemeral=should_use_ephemeral(interaction)); return
 
         cur = conn.cursor()
         cur.execute("SELECT id, owner_user_id FROM pos WHERE guild_id=? AND name=? LIMIT 1", (gid, name))
@@ -3536,7 +3554,7 @@ async def addpos_cmd(
             pos_id = int(r["id"])
             owner_id = int(r["owner_user_id"])
             if not (is_admin_user(interaction) or owner_id == uid):
-                await interaction.followup.send("⛔ Этот POS принадлежит другому пользователю.", ephemeral=True)
+                await interaction.followup.send("⛔ Этот POS принадлежит другому пользователю.", ephemeral=should_use_ephemeral(interaction))
                 return
             cur.execute("UPDATE pos SET system=?, constellation=?, updated_at=? WHERE id=?",
                         (system, constellation, now_utc_iso(), pos_id))
@@ -3570,11 +3588,11 @@ async def addpos_cmd(
             slots_override=slots_override,
             drills_override=drills_override,
         )
-        await interaction.followup.send(msg, ephemeral=True)
+        await interaction.followup.send(msg, ephemeral=should_use_ephemeral(interaction))
 
     except Exception as e:
         logger.exception("addpos error: %s", e)
-        await interaction.followup.send(f"Ошибка: {e}", ephemeral=True)
+        await interaction.followup.send(f"Ошибка: {e}", ephemeral=should_use_ephemeral(interaction))
     finally:
         conn.close()
 
@@ -3582,13 +3600,13 @@ async def addpos_cmd(
 async def refreshpos_cmd(interaction: discord.Interaction):
     guild = interaction.guild
     if not guild:
-        await interaction.response.send_message("Только в сервере.", ephemeral=True)
+        await interaction.response.send_message("Только в сервере.", ephemeral=should_use_ephemeral(interaction))
         return
     if not is_admin_user(interaction):
-        await interaction.response.send_message("⛔ Команда доступна только администраторам сервера.", ephemeral=True)
+        await interaction.response.send_message("⛔ Команда доступна только администраторам сервера.", ephemeral=should_use_ephemeral(interaction))
         return
 
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.defer(ephemeral=should_use_ephemeral(interaction))
 
     conn = ensure_db_ready()
     try:
@@ -3596,7 +3614,7 @@ async def refreshpos_cmd(interaction: discord.Interaction):
         cur.execute("SELECT id, owner_user_id FROM pos WHERE guild_id=?", (guild.id,))
         rows = cur.fetchall()
         if not rows:
-            await interaction.followup.send("На сервере нет POS для обновления.", ephemeral=True)
+            await interaction.followup.send("На сервере нет POS для обновления.", ephemeral=should_use_ephemeral(interaction))
             return
 
         pos_ids = [int(r["id"]) for r in rows]
@@ -3611,7 +3629,7 @@ async def refreshpos_cmd(interaction: discord.Interaction):
         conn.commit()
     except Exception as e:
         logger.exception("refreshpos error: %s", e)
-        await interaction.followup.send(f"Ошибка: {e}", ephemeral=True)
+        await interaction.followup.send(f"Ошибка: {e}", ephemeral=should_use_ephemeral(interaction))
         return
     finally:
         conn.close()
@@ -3655,15 +3673,15 @@ async def refreshpos_cmd(interaction: discord.Interaction):
         failed_mentions = ", ".join(f"<@{uid}>" for uid in failed)
         summary_lines.append("Не удалось отправить: " + failed_mentions)
 
-    await interaction.followup.send("\n".join(summary_lines), ephemeral=True)
+    await interaction.followup.send("\n".join(summary_lines), ephemeral=should_use_ephemeral(interaction))
 
 @tree.command(name="delpos", description="Удалить один POS (если без id — покажу список).")
 @app_commands.describe(pos_id="ID POS")
 async def delpos_cmd(interaction: discord.Interaction, pos_id: Optional[int] = None):
     guild = interaction.guild
     if not guild:
-        await interaction.response.send_message("Только в сервере.", ephemeral=True); return
-    await interaction.response.defer(ephemeral=True)
+        await interaction.response.send_message("Только в сервере.", ephemeral=should_use_ephemeral(interaction)); return
+    await interaction.response.defer(ephemeral=should_use_ephemeral(interaction))
     conn = ensure_db_ready()
     try:
         cur = conn.cursor()
@@ -3671,26 +3689,26 @@ async def delpos_cmd(interaction: discord.Interaction, pos_id: Optional[int] = N
             cur.execute("SELECT id, name, system, constellation, created_at FROM pos WHERE guild_id=? ORDER BY id DESC", (guild.id,))
             rows = cur.fetchall()
             if not rows:
-                await interaction.followup.send("POS-ов нет.", ephemeral=True); return
+                await interaction.followup.send("POS-ов нет.", ephemeral=should_use_ephemeral(interaction)); return
             lines = [f"ID **{r['id']}** — {r['name']} ({r['system']}, {r['constellation']}) · создан {r['created_at']}" for r in rows[:25]]
-            await interaction.followup.send("Укажи `/delpos pos_id:<ID>`:\n" + "\n".join(lines), ephemeral=True)
+            await interaction.followup.send("Укажи `/delpos pos_id:<ID>`:\n" + "\n".join(lines), ephemeral=should_use_ephemeral(interaction))
             return
 
         cur.execute("SELECT id FROM pos WHERE id=? AND guild_id=?", (pos_id, guild.id))
         if not cur.fetchone():
-            await interaction.followup.send("POS не найден.", ephemeral=True); return
+            await interaction.followup.send("POS не найден.", ephemeral=should_use_ephemeral(interaction)); return
 
         if not ensure_owner_or_admin(conn, interaction, pos_id):
-            await interaction.followup.send("⛔ Удалять может только владелец POS или админ сервера.", ephemeral=True)
+            await interaction.followup.send("⛔ Удалять может только владелец POS или админ сервера.", ephemeral=should_use_ephemeral(interaction))
             return
 
         cur.execute("DELETE FROM pos_planet WHERE pos_id=?", (pos_id,))
         cur.execute("DELETE FROM pos WHERE id=?", (pos_id,))
         conn.commit()
-        await interaction.followup.send(f"🗑️ POS **{pos_id}** удалён.", ephemeral=True)
+        await interaction.followup.send(f"🗑️ POS **{pos_id}** удалён.", ephemeral=should_use_ephemeral(interaction))
     except Exception as e:
         logger.exception("delpos error: %s", e)
-        await interaction.followup.send(f"Ошибка: {e}", ephemeral=True)
+        await interaction.followup.send(f"Ошибка: {e}", ephemeral=should_use_ephemeral(interaction))
     finally:
         conn.close()
 
@@ -3698,10 +3716,10 @@ async def delpos_cmd(interaction: discord.Interaction, pos_id: Optional[int] = N
 async def delallpos_cmd(interaction: discord.Interaction):
     guild = interaction.guild
     if not guild:
-        await interaction.response.send_message("Только в сервере.", ephemeral=True); return
-    await interaction.response.defer(ephemeral=True)
+        await interaction.response.send_message("Только в сервере.", ephemeral=should_use_ephemeral(interaction)); return
+    await interaction.response.defer(ephemeral=should_use_ephemeral(interaction))
     if not is_admin_user(interaction):
-        await interaction.followup.send("⛔ Команда доступна только администраторам сервера.", ephemeral=True)
+        await interaction.followup.send("⛔ Команда доступна только администраторам сервера.", ephemeral=should_use_ephemeral(interaction))
         return
     conn = ensure_db_ready()
     try:
@@ -3712,10 +3730,10 @@ async def delallpos_cmd(interaction: discord.Interaction):
             cur.execute("DELETE FROM pos_planet WHERE pos_id IN (%s)" % ",".join("?"*len(ids)), ids)
             cur.execute("DELETE FROM pos WHERE guild_id=?", (guild.id,))
             conn.commit()
-        await interaction.followup.send(f"🧹 Удалено POS-ов: **{len(ids)}**.", ephemeral=True)
+        await interaction.followup.send(f"🧹 Удалено POS-ов: **{len(ids)}**.", ephemeral=should_use_ephemeral(interaction))
     except Exception as e:
         logger.exception("delallpos error: %s", e)
-        await interaction.followup.send(f"Ошибка: {e}", ephemeral=True)
+        await interaction.followup.send(f"Ошибка: {e}", ephemeral=should_use_ephemeral(interaction))
     finally:
         conn.close()
 
@@ -3723,8 +3741,8 @@ async def delallpos_cmd(interaction: discord.Interaction):
 async def mypos_cmd(interaction: discord.Interaction):
     guild = interaction.guild
     if not guild:
-        await interaction.response.send_message("Только в сервере.", ephemeral=True); return
-    await interaction.response.defer(ephemeral=True)
+        await interaction.response.send_message("Только в сервере.", ephemeral=should_use_ephemeral(interaction)); return
+    await interaction.response.defer(ephemeral=should_use_ephemeral(interaction))
     conn = ensure_db_ready()
     try:
         cur = conn.cursor()
@@ -3736,15 +3754,15 @@ async def mypos_cmd(interaction: discord.Interaction):
         """, (guild.id, interaction.user.id))
         rows = cur.fetchall()
         if not rows:
-            await interaction.followup.send("У тебя ещё нет POS-ов.", ephemeral=True); return
+            await interaction.followup.send("У тебя ещё нет POS-ов.", ephemeral=should_use_ephemeral(interaction)); return
         lines = [
             f"ID **{r['id']}** — {r['name']} ({r['system']}, {r['constellation']}) · создан {r['created_at']} · обновлён {r['updated_at']}"
             for r in rows[:25]
         ]
-        await interaction.followup.send("\n".join(lines), ephemeral=True)
+        await interaction.followup.send("\n".join(lines), ephemeral=should_use_ephemeral(interaction))
     except Exception as e:
         logger.exception("mypos error: %s", e)
-        await interaction.followup.send(f"Ошибка: {e}", ephemeral=True)
+        await interaction.followup.send(f"Ошибка: {e}", ephemeral=should_use_ephemeral(interaction))
     finally:
         conn.close()
 
@@ -3752,7 +3770,7 @@ async def mypos_cmd(interaction: discord.Interaction):
 async def posstats_cmd(interaction: discord.Interaction):
     guild = interaction.guild
     if not guild:
-        await interaction.response.send_message("Только в сервере.", ephemeral=True); return
+        await interaction.response.send_message("Только в сервере.", ephemeral=should_use_ephemeral(interaction)); return
     await interaction.response.defer(ephemeral=False)
     conn = ensure_db_ready()
     try:
@@ -3783,7 +3801,7 @@ async def posstats_cmd(interaction: discord.Interaction):
         await interaction.followup.send(header + "\n\n" + body, ephemeral=False)
     except Exception as e:
         logger.exception("posstats error: %s", e)
-        await interaction.followup.send(f"Ошибка: {e}", ephemeral=True)
+        await interaction.followup.send(f"Ошибка: {e}", ephemeral=should_use_ephemeral(interaction))
     finally:
         conn.close()
 
@@ -3800,13 +3818,13 @@ async def updatebot_cmd(
 ):
     guild = interaction.guild
     if not guild:
-        await interaction.response.send_message("Команда доступна только в сервере.", ephemeral=True)
+        await interaction.response.send_message("Команда доступна только в сервере.", ephemeral=should_use_ephemeral(interaction))
         return
     if not is_admin_user(interaction):
-        await interaction.response.send_message("Требуются права администратора сервера.", ephemeral=True)
+        await interaction.response.send_message("Требуются права администратора сервера.", ephemeral=should_use_ephemeral(interaction))
         return
 
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.defer(ephemeral=should_use_ephemeral(interaction))
     try:
         success, log_text = await update_bot_repository(branch, reinstall_deps)
         status = "✅ Обновление завершено успешно." if success else "⚠️ Обновление завершилось с ошибкой."
@@ -3833,7 +3851,7 @@ async def updatebot_cmd(
         await send_long(
             interaction,
             body,
-            ephemeral=True,
+            ephemeral=should_use_ephemeral(interaction),
             title="Обновление бота",
         )
 
@@ -3841,7 +3859,7 @@ async def updatebot_cmd(
             logger.info("Перезапуск службы после updatebot не настроен (BOT_SERVICE_NAME не задана).")
     except Exception as e:
         logger.exception("updatebot error: %s", e)
-        await interaction.followup.send(f"Ошибка при обновлении: {e}", ephemeral=True)
+        await interaction.followup.send(f"Ошибка при обновлении: {e}", ephemeral=should_use_ephemeral(interaction))
 
 
 # --- НОВОЕ: мои назначения (планеты/буры) ---
@@ -3850,8 +3868,8 @@ async def updatebot_cmd(
 async def myassigns_cmd(interaction: discord.Interaction, pos_id: Optional[int] = None):
     guild = interaction.guild
     if not guild:
-        await interaction.response.send_message("Только в сервере.", ephemeral=True); return
-    await interaction.response.defer(ephemeral=True)
+        await interaction.response.send_message("Только в сервере.", ephemeral=should_use_ephemeral(interaction)); return
+    await interaction.response.defer(ephemeral=should_use_ephemeral(interaction))
     conn = ensure_db_ready()
     try:
         cur = conn.cursor()
@@ -3863,7 +3881,7 @@ async def myassigns_cmd(interaction: discord.Interaction, pos_id: Optional[int] 
             """, (guild.id, pos_id, interaction.user.id))
             pos_rows = cur.fetchall()
             if not pos_rows:
-                await interaction.followup.send("POS не найден или принадлежит другому пользователю.", ephemeral=True); return
+                await interaction.followup.send("POS не найден или принадлежит другому пользователю.", ephemeral=should_use_ephemeral(interaction)); return
         else:
             cur.execute("""
                 SELECT id, name, system, constellation
@@ -3873,7 +3891,7 @@ async def myassigns_cmd(interaction: discord.Interaction, pos_id: Optional[int] 
             """, (guild.id, interaction.user.id))
             pos_rows = cur.fetchall()
             if not pos_rows:
-                await interaction.followup.send("У тебя ещё нет POS-ов.", ephemeral=True); return
+                await interaction.followup.send("У тебя ещё нет POS-ов.", ephemeral=should_use_ephemeral(interaction)); return
 
         lines = []
         for p in pos_rows:
@@ -3907,10 +3925,10 @@ async def myassigns_cmd(interaction: discord.Interaction, pos_id: Optional[int] 
                     f"base={float(r['rate']):.2f}/h/bore → **{total_rate:,.2f}/ч**".replace(",", " ")
                 )
             lines.append("")
-        await send_long(interaction, "\n".join(lines), ephemeral=True, title="Мои назначения")
+        await send_long(interaction, "\n".join(lines), ephemeral=should_use_ephemeral(interaction), title="Мои назначения")
     except Exception as e:
         logger.exception("myassigns error: %s", e)
-        await interaction.followup.send(f"Ошибка: {e}", ephemeral=True)
+        await interaction.followup.send(f"Ошибка: {e}", ephemeral=should_use_ephemeral(interaction))
     finally:
         conn.close()
 
@@ -3920,7 +3938,7 @@ async def myassigns_cmd(interaction: discord.Interaction, pos_id: Optional[int] 
 async def userpos_cmd(interaction: discord.Interaction, user: discord.User):
     guild = interaction.guild
     if not guild:
-        await interaction.response.send_message("Только в сервере.", ephemeral=True); return
+        await interaction.response.send_message("Только в сервере.", ephemeral=should_use_ephemeral(interaction)); return
     await interaction.response.defer(ephemeral=False)
     conn = ensure_db_ready()
     try:
@@ -3952,7 +3970,7 @@ async def userpos_cmd(interaction: discord.Interaction, user: discord.User):
         await send_long(interaction, "\n".join(lines), ephemeral=False, title="POS пользователя")
     except Exception as e:
         logger.exception("userpos error: %s", e)
-        await interaction.followup.send(f"Ошибка: {e}", ephemeral=True)
+        await interaction.followup.send(f"Ошибка: {e}", ephemeral=should_use_ephemeral(interaction))
     finally:
         conn.close()
 
