@@ -4520,6 +4520,7 @@ async def addpos_cmd(
         cur = conn.cursor()
         cur.execute("SELECT id, owner_user_id FROM pos WHERE guild_id=? AND name=? LIMIT 1", (gid, name))
         r = cur.fetchone()
+        log_parts: List[str] = []
         if r:
             pos_id = int(r["id"])
             owner_id = int(r["owner_user_id"])
@@ -4530,12 +4531,18 @@ async def addpos_cmd(
                         (system, constellation, now_utc_iso(), pos_id))
             cur.execute("DELETE FROM pos_planet WHERE pos_id=?", (pos_id,))
             conn.commit()
+            log_parts.append(
+                f"🛠️ {_format_log_value(interaction.user)} обновил POS **{name}** (# {pos_id})"
+            )
         else:
             cur.execute("""INSERT INTO pos(guild_id, owner_user_id, name, system, constellation, created_at, updated_at)
                            VALUES(?,?,?,?,?,?,?)""",
                         (gid, uid, name, system, constellation, now_utc_iso(), now_utc_iso()))
             pos_id = cur.lastrowid
             conn.commit()
+            log_parts.append(
+                f"🆕 {_format_log_value(interaction.user)} создал POS **{name}** (# {pos_id})"
+            )
 
         assignments = compute_pos_assignments(
             conn=conn,
@@ -4559,6 +4566,12 @@ async def addpos_cmd(
             drills_override=drills_override,
         )
         await interaction.followup.send(msg, ephemeral=should_use_ephemeral(interaction))
+
+        if log_parts:
+            log_parts.append(
+                f"система: {system}; созвездие: {constellation}; планет: {len(assignments)}; слотов: {slots_val}; буров: {drills_val}"
+            )
+            await send_guild_log_message(interaction.guild_id, "; ".join(log_parts))
 
     except Exception as e:
         logger.exception("addpos error: %s", e)
@@ -4645,6 +4658,19 @@ async def refreshpos_cmd(interaction: discord.Interaction):
 
     await interaction.followup.send("\n".join(summary_lines), ephemeral=should_use_ephemeral(interaction))
 
+    await send_guild_log_message(
+        interaction.guild_id,
+        "; ".join(
+            [
+                f"🔄 {_format_log_value(interaction.user)} сбросил назначения POS ({len(pos_ids)} шт.)",
+                f"удалено планетарных назначений: {deleted_assignments}",
+                f"сброшено подтверждений: {cleared_acks}",
+                f"владельцев уведомлено: {notified}",
+                f"ошибок доставки: {len(failed)}",
+            ]
+        ),
+    )
+
 @tree.command(name="delpos", description="Удалить один POS (если без id — покажу список).")
 @app_commands.describe(pos_id="ID POS")
 async def delpos_cmd(interaction: discord.Interaction, pos_id: Optional[int] = None):
@@ -4664,8 +4690,12 @@ async def delpos_cmd(interaction: discord.Interaction, pos_id: Optional[int] = N
             await interaction.followup.send("Укажи `/delpos pos_id:<ID>`:\n" + "\n".join(lines), ephemeral=should_use_ephemeral(interaction))
             return
 
-        cur.execute("SELECT id FROM pos WHERE id=? AND guild_id=?", (pos_id, guild.id))
-        if not cur.fetchone():
+        cur.execute(
+            "SELECT id, name, system, constellation FROM pos WHERE id=? AND guild_id=?",
+            (pos_id, guild.id),
+        )
+        row = cur.fetchone()
+        if not row:
             await interaction.followup.send("POS не найден.", ephemeral=should_use_ephemeral(interaction)); return
 
         if not ensure_owner_or_admin(conn, interaction, pos_id):
@@ -4676,6 +4706,16 @@ async def delpos_cmd(interaction: discord.Interaction, pos_id: Optional[int] = N
         cur.execute("DELETE FROM pos WHERE id=?", (pos_id,))
         conn.commit()
         await interaction.followup.send(f"🗑️ POS **{pos_id}** удалён.", ephemeral=should_use_ephemeral(interaction))
+
+        await send_guild_log_message(
+            interaction.guild_id,
+            " ".join(
+                [
+                    f"🗑️ {_format_log_value(interaction.user)} удалил POS **{row['name']}**",
+                    f"(# {pos_id}) в системе {row['system']} ({row['constellation']}).",
+                ]
+            ),
+        )
     except Exception as e:
         logger.exception("delpos error: %s", e)
         await interaction.followup.send(f"Ошибка: {e}", ephemeral=should_use_ephemeral(interaction))
@@ -4694,13 +4734,25 @@ async def delallpos_cmd(interaction: discord.Interaction):
     conn = ensure_db_ready()
     try:
         cur = conn.cursor()
-        cur.execute("SELECT id FROM pos WHERE guild_id=?", (guild.id,))
-        ids = [r["id"] for r in cur.fetchall()]
+        cur.execute(
+            "SELECT id, name FROM pos WHERE guild_id=? ORDER BY id",
+            (guild.id,),
+        )
+        rows = cur.fetchall()
+        ids = [int(r["id"]) for r in rows]
         if ids:
             cur.execute("DELETE FROM pos_planet WHERE pos_id IN (%s)" % ",".join("?"*len(ids)), ids)
             cur.execute("DELETE FROM pos WHERE guild_id=?", (guild.id,))
             conn.commit()
         await interaction.followup.send(f"🧹 Удалено POS-ов: **{len(ids)}**.", ephemeral=should_use_ephemeral(interaction))
+
+        if ids:
+            preview_names = ", ".join(r["name"] for r in rows[:10])
+            extra = "" if len(rows) <= 10 else f" … и ещё {len(rows) - 10}"
+            await send_guild_log_message(
+                interaction.guild_id,
+                f"🧹 {_format_log_value(interaction.user)} удалил все POS ({len(ids)} шт.). Список: {preview_names}{extra}",
+            )
     except Exception as e:
         logger.exception("delallpos error: %s", e)
         await interaction.followup.send(f"Ошибка: {e}", ephemeral=should_use_ephemeral(interaction))
