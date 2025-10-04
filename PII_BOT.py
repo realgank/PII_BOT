@@ -1,6 +1,7 @@
 ﻿# bot_pos.py
 import os
 import sys
+import json
 import logging
 import sqlite3
 import pathlib
@@ -13,6 +14,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parent
+UPDATE_STATE_PATH = PROJECT_ROOT / ".last_update_state.json"
 
 
 def _load_env_file() -> None:
@@ -174,6 +176,30 @@ async def run_subprocess(cmd: List[str], cwd: Optional[pathlib.Path] = None) -> 
     )
 
 
+def _sanitize_log_line(line: str) -> Optional[str]:
+    if line is None:
+        return None
+    stripped = line.strip()
+    if not stripped:
+        return None
+    sanitized = re.sub(
+        r"https?://github\.com/\S+",
+        "GitHub (ссылка скрыта)",
+        stripped,
+        flags=re.IGNORECASE,
+    )
+    return sanitized
+
+
+def _extend_logs(logs: List[str], text: Optional[str]) -> None:
+    if not text:
+        return
+    for line in text.splitlines():
+        sanitized = _sanitize_log_line(line)
+        if sanitized:
+            logs.append(sanitized)
+
+
 async def update_bot_repository(branch: Optional[str], reinstall_deps: bool) -> Tuple[bool, str]:
     git_path = shutil.which("git")
     if not git_path:
@@ -183,7 +209,7 @@ async def update_bot_repository(branch: Optional[str], reinstall_deps: bool) -> 
     if not (repo_dir / ".git").exists():
         return False, f"Каталог {repo_dir} не является git-репозиторием."
 
-    target_branch = branch or os.getenv("BOT_UPDATE_BRANCH") or ""
+    target_branch = branch or os.getenv("BOT_UPDATE_BRANCH") or "master"
     commands: List[List[str]] = []
 
     if target_branch:
@@ -197,33 +223,29 @@ async def update_bot_repository(branch: Optional[str], reinstall_deps: bool) -> 
 
     for cmd in commands:
         code, out, err = await run_subprocess(cmd, repo_dir)
-        logs.append("$ " + " ".join(cmd))
-        if out.strip():
-            logs.append(out.strip())
-        if err.strip():
-            logs.append(err.strip())
+        _extend_logs(logs, "$ " + " ".join(cmd))
+        _extend_logs(logs, out)
+        _extend_logs(logs, err)
         if code != 0:
-            logs.append(f"Команда завершилась с кодом {code}.")
+            _extend_logs(logs, f"Команда завершилась с кодом {code}.")
             return False, "\n".join(logs)
 
     if reinstall_deps:
         req_file = repo_dir / "requirements.txt"
         if not req_file.exists():
-            logs.append("requirements.txt не найден, пропускаю установку зависимостей.")
+            _extend_logs(logs, "requirements.txt не найден, пропускаю установку зависимостей.")
         else:
             pip_cmd = [sys.executable, "-m", "pip", "install", "-r", str(req_file)]
             code, out, err = await run_subprocess(pip_cmd, repo_dir)
-            logs.append("$ " + " ".join(pip_cmd))
-            if out.strip():
-                logs.append(out.strip())
-            if err.strip():
-                logs.append(err.strip())
+            _extend_logs(logs, "$ " + " ".join(pip_cmd))
+            _extend_logs(logs, out)
+            _extend_logs(logs, err)
             if code != 0:
-                logs.append(f"Команда завершилась с кодом {code}.")
+                _extend_logs(logs, f"Команда завершилась с кодом {code}.")
                 return False, "\n".join(logs)
 
     if not logs:
-        logs.append("Команды выполнены.")
+        _extend_logs(logs, "Команды выполнены.")
 
     return True, "\n".join(logs)
 
@@ -259,6 +281,63 @@ def prepare_service_restart() -> Tuple[Optional[str], Optional[asyncio.Task]]:
     loop = asyncio.get_running_loop()
     task = loop.create_task(_restart())
     return f"🔄 Служба **{BOT_SERVICE_NAME}** будет перезапущена в ближайшие секунды.", task
+
+
+def remember_successful_update(interaction: discord.Interaction) -> None:
+    if interaction.channel_id is None:
+        return
+    payload = {
+        "channel_id": interaction.channel_id,
+        "guild_id": interaction.guild_id,
+        "user_id": getattr(interaction.user, "id", None),
+        "timestamp": now_utc_iso(),
+    }
+    try:
+        UPDATE_STATE_PATH.write_text(json.dumps(payload), encoding="utf-8")
+    except Exception:
+        logger.exception("Не удалось сохранить информацию об успешном обновлении.")
+
+
+async def notify_after_restart() -> None:
+    if not UPDATE_STATE_PATH.exists():
+        return
+    try:
+        data = json.loads(UPDATE_STATE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        logger.exception("Не удалось прочитать файл состояния обновления.")
+        try:
+            UPDATE_STATE_PATH.unlink(missing_ok=True)
+        except Exception:
+            logger.exception("Не удалось удалить файл состояния обновления.")
+        return
+
+    channel_id = data.get("channel_id")
+    user_id = data.get("user_id")
+    timestamp = data.get("timestamp")
+
+    try:
+        channel = None
+        if channel_id is not None:
+            channel = bot.get_channel(int(channel_id))
+            if channel is None:
+                try:
+                    channel = await bot.fetch_channel(int(channel_id))
+                except Exception:
+                    logger.exception("Не удалось получить канал %s для уведомления об обновлении.", channel_id)
+        if channel is not None:
+            message = "✅ Бот обновился и перезапустился."
+            if user_id:
+                message += f" Инициатор: <@{int(user_id)}>"
+            if timestamp:
+                message += f" (обновлено {format_ts(timestamp)})."
+            await channel.send(message)
+    except Exception:
+        logger.exception("Не удалось отправить уведомление об обновлении.")
+    finally:
+        try:
+            UPDATE_STATE_PATH.unlink(missing_ok=True)
+        except Exception:
+            logger.exception("Не удалось удалить файл состояния обновления после уведомления.")
 
 # --- проверка токена Discord ---
 def validate_and_clean_token(raw: Optional[str]) -> Optional[str]:
@@ -3743,6 +3822,7 @@ async def updatebot_cmd(
                     "Перезапуск службы %s не был запланирован (проверьте systemctl).",
                     BOT_SERVICE_NAME,
                 )
+            remember_successful_update(interaction)
         else:
             extra_lines.append("Перезапуск службы пропущен из-за ошибки обновления.")
 
@@ -3907,6 +3987,8 @@ async def on_ready():
     if reminder_task is None or reminder_task.done():
         reminder_task = bot.loop.create_task(resource_reminder_loop())
         logger.info("Цикл напоминаний о сдаче ресурсов запущен.")
+
+    await notify_after_restart()
 
 def main():
     token = validate_and_clean_token(DISCORD_TOKEN)
