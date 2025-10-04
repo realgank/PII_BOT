@@ -13,7 +13,7 @@ from string import Formatter
 import base64
 from collections import OrderedDict
 from datetime import datetime, timezone, timedelta
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+from typing import Dict, List, Optional, Sequence, Set, Tuple, Union
 
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parent
 UPDATE_STATE_PATH = PROJECT_ROOT / ".last_update_state.json"
@@ -2709,6 +2709,59 @@ async def system_autocomplete(interaction: discord.Interaction, current: str) ->
         items = [s for s in items if q in s.lower()]
     return [app_commands.Choice(name=s, value=s) for s in items[:25]]
 
+
+async def addpos_name_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> List[app_commands.Choice[str]]:
+    guild = interaction.guild
+    if not guild:
+        return []
+
+    user_id = getattr(interaction.user, "id", None)
+    if user_id is None:
+        return []
+
+    conn = ensure_db_ready()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT name
+            FROM pos
+            WHERE guild_id=? AND owner_user_id=?
+            ORDER BY updated_at DESC, name COLLATE NOCASE
+            """,
+            (int(guild.id), int(user_id)),
+        )
+        rows = cur.fetchall()
+    except Exception:
+        logger.exception("addpos_name_autocomplete error")
+        return []
+    finally:
+        conn.close()
+
+    q = (current or "").strip().lower()
+    seen: Set[str] = set()
+    names: List[str] = []
+    for row in rows:
+        name_raw = row["name"] if row else None
+        if not name_raw:
+            continue
+        name = str(name_raw).strip()
+        if not name:
+            continue
+        if q and q not in name.lower():
+            continue
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        names.append(name)
+        if len(names) >= 25:
+            break
+
+    return [app_commands.Choice(name=value, value=value) for value in names]
+
 # --- автодополнение ресурсов (объединённое) ---
 def resource_autocomplete_choices(conn: sqlite3.Connection, guild_id: Optional[int] = None) -> List[str]:
     cur = conn.cursor()
@@ -4483,7 +4536,7 @@ async def have_cmd(interaction: discord.Interaction, action: app_commands.Choice
     slots="Сколько планет-слотов назначать (по умолчанию 10)",
     drills="Сколько буров ставить на планету (по умолчанию 22)",
 )
-@app_commands.autocomplete(system=system_autocomplete)
+@app_commands.autocomplete(name=addpos_name_autocomplete, system=system_autocomplete)
 async def addpos_cmd(
     interaction: discord.Interaction,
     name: str,
