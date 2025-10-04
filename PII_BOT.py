@@ -4216,9 +4216,18 @@ async def clearneeds_cmd(interaction: discord.Interaction):
         conn.close()
 
 @tree.command(name="eta", description="ETA по всем целям (units) при текущей суммарной скорости (учитывает склад).")
-@app_commands.describe(resource="Опционально: конкретный ресурс", limit="Макс. строк (по умолчанию 20)")
+@app_commands.describe(
+    resource="Опционально: конкретный ресурс",
+    limit="Макс. строк (по умолчанию 20)",
+    detailed="Показать подробную сводку",
+)
 @app_commands.autocomplete(resource=resource_autocomplete)
-async def eta_cmd(interaction: discord.Interaction, resource: Optional[str] = None, limit: Optional[int] = 20):
+async def eta_cmd(
+    interaction: discord.Interaction,
+    resource: Optional[str] = None,
+    limit: Optional[int] = 20,
+    detailed: Optional[bool] = False,
+):
     guild = interaction.guild
     if not guild:
         await interaction.response.send_message("Только в сервере.", ephemeral=should_use_ephemeral(interaction)); return
@@ -4247,10 +4256,13 @@ async def eta_cmd(interaction: discord.Interaction, resource: Optional[str] = No
                 await interaction.followup.send(f"Для **{res}** цель не задана.", ephemeral=should_use_ephemeral(interaction)); return
             left = needs_left.get(res, 0.0)
             eta_txt, _ = fmt(left, rph.get(res, 0.0))
-            lines.append(
-                f"**{res}** — цель {amount_total:,.0f} — на складе {have.get(res,0.0):,.0f} — осталось {left:,.0f} — сейчас {rph.get(res,0.0):,.2f}/ч — ETA: **{eta_txt}**"
-                .replace(",", " ")
-            )
+            if detailed:
+                lines.append(
+                    f"**{res}** — цель {amount_total:,.0f} — на складе {have.get(res,0.0):,.0f} — осталось {left:,.0f} — сейчас {rph.get(res,0.0):,.2f}/ч — ETA: **{eta_txt}**"
+                    .replace(",", " ")
+                )
+            else:
+                lines.append(f"**{res}** — ETA: **{eta_txt}**")
         else:
             rows=[]
             for res, amount_total in needs.items():
@@ -4261,10 +4273,13 @@ async def eta_cmd(interaction: discord.Interaction, resource: Optional[str] = No
             shown=0
             for res, amount_total, have_amt, left, rate, _days, txt in rows:
                 if shown >= int(limit or 20): break
-                lines.append(
-                    f"**{res}** — цель {amount_total:,.0f} — склад {have_amt:,.0f} — осталось {left:,.0f} — сейчас {rate:,.2f}/ч — ETA: **{txt}**"
-                    .replace(",", " ")
-                )
+                if detailed:
+                    lines.append(
+                        f"**{res}** — цель {amount_total:,.0f} — склад {have_amt:,.0f} — осталось {left:,.0f} — сейчас {rate:,.2f}/ч — ETA: **{txt}**"
+                        .replace(",", " ")
+                    )
+                else:
+                    lines.append(f"**{res}** — ETA: **{txt}**")
                 shown += 1
             if not lines: lines.append("_Цели не заданы. Используйте `/setneed`._")
 
