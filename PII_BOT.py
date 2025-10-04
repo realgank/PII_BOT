@@ -227,7 +227,28 @@ async def update_bot_repository(branch: Optional[str], reinstall_deps: bool) -> 
     if not (repo_dir / ".git").exists():
         return False, f"Каталог {repo_dir} не является git-репозиторием."
 
-    target_branch = branch or os.getenv("BOT_UPDATE_BRANCH") or "master"
+    logs: List[str] = []
+
+    target_branch = branch or os.getenv("BOT_UPDATE_BRANCH")
+
+    if not target_branch:
+        code, out, err = await run_subprocess(
+            [git_path, "rev-parse", "--abbrev-ref", "HEAD"],
+            repo_dir,
+        )
+        _extend_logs(logs, "$ git rev-parse --abbrev-ref HEAD")
+        _extend_logs(logs, out)
+        _extend_logs(logs, err)
+        if code == 0:
+            current_branch = out.strip()
+            if current_branch and current_branch != "HEAD":
+                target_branch = current_branch
+        if not target_branch:
+            target_branch = "master"
+            _extend_logs(
+                logs,
+                "Ветка не указана, используем master по умолчанию.",
+            )
     commands: List[List[str]] = []
 
     if target_branch:
@@ -236,8 +257,6 @@ async def update_bot_repository(branch: Optional[str], reinstall_deps: bool) -> 
         commands.append([git_path, "pull", "--ff-only", "origin", target_branch])
     else:
         commands.append([git_path, "pull", "--ff-only"])
-
-    logs: List[str] = []
 
     for cmd in commands:
         code, out, err = await run_subprocess(cmd, repo_dir)
