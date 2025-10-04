@@ -3025,54 +3025,6 @@ async def posdefaults_setguild(interaction: discord.Interaction, slots: int, dri
     finally:
         conn.close()
 
-@posdefaults_group.command(name="set", description="Установить личные значения по умолчанию.")
-@app_commands.describe(slots="Количество планет-слотов", drills="Количество буров на планету")
-async def posdefaults_setuser(interaction: discord.Interaction, slots: int, drills: int):
-    guild = interaction.guild
-    if not guild:
-        await interaction.response.send_message("Только в сервере.", ephemeral=should_use_ephemeral(interaction))
-        return
-    await interaction.response.defer(ephemeral=should_use_ephemeral(interaction))
-
-    err = _validate_default_bounds(int(slots), "slots") or _validate_default_bounds(int(drills), "drills")
-    if err:
-        await interaction.followup.send(err, ephemeral=should_use_ephemeral(interaction))
-        return
-
-    conn = ensure_db_ready()
-    try:
-        set_pos_defaults(conn, guild.id, int(slots), int(drills), user_id=interaction.user.id)
-        report = build_pos_defaults_report(conn, guild.id, interaction.user.id)
-        await interaction.followup.send(
-            "✅ Личные значения по умолчанию сохранены.\n" + report,
-            ephemeral=should_use_ephemeral(interaction),
-        )
-    except Exception as e:
-        logger.exception("posdefaults_setuser error: %s", e)
-        await interaction.followup.send(f"Ошибка: {e}", ephemeral=should_use_ephemeral(interaction))
-    finally:
-        conn.close()
-
-@posdefaults_group.command(name="clear", description="Очистить личные значения и использовать серверные/ENV.")
-async def posdefaults_clear(interaction: discord.Interaction):
-    guild = interaction.guild
-    if not guild:
-        await interaction.response.send_message("Только в сервере.", ephemeral=should_use_ephemeral(interaction))
-        return
-    await interaction.response.defer(ephemeral=should_use_ephemeral(interaction))
-
-    conn = ensure_db_ready()
-    try:
-        removed = clear_user_pos_defaults(conn, guild.id, interaction.user.id)
-        report = build_pos_defaults_report(conn, guild.id, interaction.user.id)
-        head = "🧹 Личные значения удалены." if removed else "ℹ️ Личные значения не были заданы."
-        await interaction.followup.send(head + "\n" + report, ephemeral=should_use_ephemeral(interaction))
-    except Exception as e:
-        logger.exception("posdefaults_clear error: %s", e)
-        await interaction.followup.send(f"Ошибка: {e}", ephemeral=should_use_ephemeral(interaction))
-    finally:
-        conn.close()
-
 @posdefaults_group.command(name="show", description="Показать активные значения по умолчанию для /addpos.")
 async def posdefaults_show(interaction: discord.Interaction):
     guild = interaction.guild
