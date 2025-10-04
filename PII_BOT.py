@@ -2308,8 +2308,8 @@ posdefaults_group = app_commands.Group(
 )
 
 def _validate_default_bounds(value: int, kind: str) -> Optional[str]:
-    if kind == "slots" and not (1 <= value <= 20):
-        return "`slots` должен быть в диапазоне 1..20."
+    if kind == "slots" and not (6 <= value <= 14):
+        return "`slots` должен быть в диапазоне 6..14."
     if kind == "drills" and not (1 <= value <= 50):
         return "`drills` должен быть в диапазоне 1..50."
     return None
