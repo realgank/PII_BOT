@@ -558,6 +558,13 @@ DDL = [
     "CREATE INDEX IF NOT EXISTS ix_resource_ping_submission_item_ping ON resource_ping_submission_item(ping_id);",
     "CREATE INDEX IF NOT EXISTS ix_resource_ping_submission_item_user ON resource_ping_submission_item(user_id);",
     "CREATE INDEX IF NOT EXISTS ix_resource_ping_reminder_time ON resource_ping_reminder(last_reminded_at);",
+    """
+    CREATE TABLE IF NOT EXISTS guild_log_channel (
+        guild_id   INTEGER PRIMARY KEY,
+        channel_id INTEGER NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+    """,
 ]
 
 
@@ -668,6 +675,180 @@ def ensure_db_ready() -> sqlite3.Connection:
     conn = connect_db(DB_PATH)
     ensure_schema(conn)
     return conn
+
+# ==================== ЛОГ-КАНАЛ ====================
+_guild_log_channel_cache: Dict[int, Optional[int]] = {}
+
+def get_guild_log_channel(conn: sqlite3.Connection, guild_id: int) -> Optional[int]:
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT channel_id FROM guild_log_channel WHERE guild_id=? LIMIT 1",
+        (guild_id,),
+    )
+    row = cur.fetchone()
+    return int(row["channel_id"]) if row else None
+
+def set_guild_log_channel(conn: sqlite3.Connection, guild_id: int, channel_id: int) -> None:
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO guild_log_channel (guild_id, channel_id, updated_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(guild_id) DO UPDATE SET
+            channel_id=excluded.channel_id,
+            updated_at=excluded.updated_at
+        """,
+        (int(guild_id), int(channel_id), now_utc_iso()),
+    )
+    conn.commit()
+    _guild_log_channel_cache[guild_id] = int(channel_id)
+
+def clear_guild_log_channel(conn: sqlite3.Connection, guild_id: int) -> bool:
+    cur = conn.cursor()
+    cur.execute("DELETE FROM guild_log_channel WHERE guild_id=?", (int(guild_id),))
+    deleted = cur.rowcount > 0
+    if deleted:
+        conn.commit()
+    _guild_log_channel_cache[guild_id] = None
+    return deleted
+
+def cached_log_channel_id(guild_id: int) -> Optional[int]:
+    if guild_id in _guild_log_channel_cache:
+        return _guild_log_channel_cache[guild_id]
+    conn = ensure_db_ready()
+    try:
+        channel_id = get_guild_log_channel(conn, guild_id)
+    finally:
+        conn.close()
+    _guild_log_channel_cache[guild_id] = channel_id
+    return channel_id
+
+def _truncate_log_text(text: str, limit: int = 180) -> str:
+    clean = " ".join(text.split())
+    if len(clean) <= limit:
+        return clean
+    return clean[: limit - 1] + "…"
+
+def _format_log_value(value: object) -> str:
+    if isinstance(value, app_commands.Namespace):
+        inner = format_namespace_for_log(value)
+        return f"({inner})" if inner else "()"
+    if isinstance(value, (list, tuple, set)):
+        return "[" + ", ".join(_format_log_value(v) for v in value) + "]"
+    if isinstance(value, dict):
+        return "{" + ", ".join(f"{k}: {_format_log_value(v)}" for k, v in value.items()) + "}"
+    if isinstance(value, (discord.Member, discord.User)):
+        return f"{value.mention} ({value.id})"
+    if isinstance(value, discord.Role):
+        return f"@{value.name} ({value.id})"
+    if isinstance(value, discord.Thread):
+        return f"#{value.name} [thread] ({value.id})"
+    if isinstance(value, discord.abc.GuildChannel):
+        mention = getattr(value, "mention", None)
+        if mention:
+            return f"{mention} ({value.id})"
+        name = getattr(value, "name", None) or value.__class__.__name__
+        return f"#{name} ({value.id})"
+    if isinstance(value, discord.Attachment):
+        return f"Attachment({value.filename}, {value.size} bytes)"
+    if isinstance(value, discord.abc.Snowflake):
+        return f"ID {value.id}"
+    if isinstance(value, str):
+        return _truncate_log_text(value, 400)
+    if isinstance(value, (int, float, bool)):
+        return str(value)
+    return _truncate_log_text(repr(value), 400)
+
+def format_namespace_for_log(ns: Optional[app_commands.Namespace]) -> str:
+    if not ns:
+        return ""
+    parts: List[str] = []
+    for key, value in ns:
+        if value is None:
+            continue
+        parts.append(f"{key}={_format_log_value(value)}")
+    return ", ".join(parts)
+
+async def send_guild_log_message(
+    guild_id: Optional[int],
+    content: str,
+    *,
+    override_channel_id: Optional[int] = None,
+) -> None:
+    if guild_id is None:
+        return
+    try:
+        guild_id_int = int(guild_id)
+    except (TypeError, ValueError):
+        return
+
+    channel_id = int(override_channel_id) if override_channel_id else cached_log_channel_id(guild_id_int)
+    if not channel_id:
+        return
+
+    channel = bot.get_channel(channel_id)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(channel_id)
+        except discord.NotFound:
+            logger.warning("Канал логов %s не найден для guild %s.", channel_id, guild_id_int)
+            if override_channel_id is None:
+                _guild_log_channel_cache[guild_id_int] = None
+                conn = ensure_db_ready()
+                try:
+                    clear_guild_log_channel(conn, guild_id_int)
+                finally:
+                    conn.close()
+            return
+        except discord.Forbidden:
+            logger.warning("Нет прав на чтение канала логов %s для guild %s.", channel_id, guild_id_int)
+            if override_channel_id is None:
+                _guild_log_channel_cache[guild_id_int] = None
+            return
+        except Exception:
+            logger.exception("Не удалось получить канал логов %s для guild %s.", channel_id, guild_id_int)
+            return
+
+    timestamp = format_dt(datetime.now(timezone.utc))
+    message = f"[{timestamp}] {content}"
+    if len(message) > 1900:
+        message = message[:1897] + "…"
+
+    try:
+        await channel.send(message)
+    except discord.Forbidden:
+        logger.warning("Нет прав отправлять сообщения в канал логов %s для guild %s.", channel_id, guild_id_int)
+    except discord.HTTPException as e:
+        logger.warning("Не удалось отправить сообщение лога в канал %s: %s", channel_id, e)
+
+async def log_command_usage(
+    interaction: discord.Interaction,
+    command_name: str,
+    *,
+    success: bool,
+    error: Optional[BaseException] = None,
+) -> None:
+    if not interaction.guild_id:
+        return
+
+    user = interaction.user
+    user_repr = _format_log_value(user)
+    params = format_namespace_for_log(getattr(interaction, "namespace", None))
+    status = "✅" if success else "❌"
+    parts = [f"{status} {user_repr} использовал `/{command_name}`"]
+    if params:
+        parts.append(f"параметры: {params}")
+    if error is not None:
+        original = getattr(error, "original", None)
+        if original:
+            parts.append(f"ошибка: {error.__class__.__name__}: {_truncate_log_text(str(error), 400)}")
+            parts.append(
+                f"исходная ошибка: {original.__class__.__name__}: {_truncate_log_text(str(original), 400)}"
+            )
+        else:
+            parts.append(f"ошибка: {error.__class__.__name__}: {_truncate_log_text(str(error), 400)}")
+
+    await send_guild_log_message(interaction.guild_id, "; ".join(parts))
 
 # ==================== ДАННЫЕ / УТИЛИТЫ ====================
 def find_constellation_by_system(conn: sqlite3.Connection, system: str) -> Optional[str]:
@@ -1178,6 +1359,14 @@ class RefreshPosModal(discord.ui.Modal):
                         title=f"Назначения POS {name}",
                     )
 
+                await send_guild_log_message(
+                    self.guild_id,
+                    (
+                        f"🔄 {_format_log_value(interaction.user)} обновил POS **{name}** "
+                        f"(ID {pos_id}) — слоты {slots_val}, буры {drills_val}, планет {len(assignments)}."
+                    ),
+                )
+
         except Exception as e:
             logger.exception("refresh_pos_modal error: %s", e)
             await interaction.followup.send(f"Ошибка: {e}", ephemeral=ephemeral)
@@ -1212,6 +1401,7 @@ class PosUpdateAckButton(discord.ui.Button):
     async def callback(self, interaction: discord.Interaction):
         conn = ensure_db_ready()
         now_iso = now_utc_iso()
+        pos_name: Optional[str] = None
         try:
             cur = conn.cursor()
             cur.execute(
@@ -1227,6 +1417,7 @@ class PosUpdateAckButton(discord.ui.Button):
                 return
 
             owner_id = int(row["owner_user_id"])
+            pos_name = row["name"]
             if owner_id != interaction.user.id:
                 await interaction.response.send_message(
                     "⛔ Отметить обновление может только владелец POS.",
@@ -1276,6 +1467,14 @@ class PosUpdateAckButton(discord.ui.Button):
         await interaction.response.edit_message(
             content="\n".join(lines),
             view=self.view,
+        )
+
+        await send_guild_log_message(
+            interaction.guild_id,
+            (
+                f"📌 {_format_log_value(interaction.user)} подтвердил обновление POS **{pos_name or self.pos_id}** "
+                f"(ID {self.pos_id}) в {format_ts(now_iso)}."
+            ),
         )
 
 
@@ -1838,6 +2037,7 @@ class ResourceSubmitButton(discord.ui.Button):
         user_pos_count = 0
         submitted_pos = 0
         total_pos = 0
+        guild_id: Optional[int] = None
         try:
             cur = conn.cursor()
             (
@@ -1848,6 +2048,8 @@ class ResourceSubmitButton(discord.ui.Button):
                 submitted_pos,
                 total_pos,
             ) = record_ping_submission(cur, self.ping_id, interaction.user.id)
+            if _guild_id:
+                guild_id = int(_guild_id)
             conn.commit()
         except PingNotFoundError:
             await interaction.followup.send("Напоминание больше не доступно.", ephemeral=should_use_ephemeral(interaction))
@@ -1899,6 +2101,16 @@ class ResourceSubmitButton(discord.ui.Button):
         if total_pos > 0:
             info += f"\nПокрытие POS по напоминанию: {submitted_pos}/{total_pos}."
         await interaction.followup.send(info, ephemeral=should_use_ephemeral(interaction))
+
+        target_guild_id = guild_id or (interaction.guild_id if interaction.guild_id is not None else None)
+        status = "повторно" if already else "впервые"
+        await send_guild_log_message(
+            target_guild_id,
+            (
+                f"📥 {_format_log_value(interaction.user)} отметил сдачу по напоминанию #{self.ping_id} ({status}). "
+                f"Отметившихся пользователей: {submitted_pos}/{total_pos}."
+            ),
+        )
 
 class ResourcePingView(discord.ui.View):
     def __init__(self, ping_id: int):
@@ -1980,6 +2192,114 @@ async def resource_autocomplete(interaction: discord.Interaction, current: str) 
     if q and all(ql != x.lower() for x in filtered):
         filtered = [q] + filtered
     return [app_commands.Choice(name=r, value=r) for r in filtered[:25]]
+
+# --- управление каналом логов ---
+@tree.command(name="setlogchannel", description="Указать канал для логов действий бота.")
+@app_commands.describe(
+    channel="Канал для логов (по умолчанию текущий)",
+    disable="Включи, чтобы отключить логирование в канал",
+)
+async def set_log_channel_command(
+    interaction: discord.Interaction,
+    channel: Optional[discord.TextChannel] = None,
+    disable: Optional[bool] = False,
+):
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message(
+            "Только в сервере.",
+            ephemeral=should_use_ephemeral(interaction),
+        )
+        return
+
+    if not is_admin_user(interaction):
+        await interaction.response.send_message(
+            "⛔ Команда доступна только администраторам сервера.",
+            ephemeral=should_use_ephemeral(interaction),
+        )
+        return
+
+    if disable:
+        existing_id = cached_log_channel_id(guild.id)
+        try:
+            conn = ensure_db_ready()
+            try:
+                removed = clear_guild_log_channel(conn, guild.id)
+            finally:
+                conn.close()
+        except Exception as e:
+            logger.exception("setlogchannel disable error: %s", e)
+            await interaction.response.send_message(
+                f"Ошибка: {e}",
+                ephemeral=should_use_ephemeral(interaction),
+            )
+            return
+
+        if removed and existing_id:
+            await send_guild_log_message(
+                guild.id,
+                f"⚙️ {_format_log_value(interaction.user)} отключил канал логов.",
+                override_channel_id=existing_id,
+            )
+
+        await interaction.response.send_message(
+            "✅ Логи в канал отключены." if removed else "Канал логов не был настроен.",
+            ephemeral=should_use_ephemeral(interaction),
+        )
+        return
+
+    target_channel: Optional[discord.abc.Messageable] = channel
+    if target_channel is None:
+        if isinstance(interaction.channel, discord.TextChannel):
+            target_channel = interaction.channel
+        elif isinstance(interaction.channel, discord.Thread):
+            target_channel = interaction.channel
+
+    if target_channel is None or not hasattr(target_channel, "send"):
+        await interaction.response.send_message(
+            "Укажи текстовый канал сервера для логов.",
+            ephemeral=should_use_ephemeral(interaction),
+        )
+        return
+
+    if isinstance(target_channel, (discord.TextChannel, discord.Thread)):
+        if target_channel.guild and target_channel.guild.id != guild.id:
+            await interaction.response.send_message(
+                "Можно выбрать только канал текущего сервера.",
+                ephemeral=should_use_ephemeral(interaction),
+            )
+            return
+        channel_id = target_channel.id
+        channel_mention = target_channel.mention
+    else:
+        await interaction.response.send_message(
+            "Доступны только текстовые каналы и треды.",
+            ephemeral=should_use_ephemeral(interaction),
+        )
+        return
+
+    try:
+        conn = ensure_db_ready()
+        try:
+            set_guild_log_channel(conn, guild.id, channel_id)
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.exception("setlogchannel error: %s", e)
+        await interaction.response.send_message(
+            f"Ошибка: {e}",
+            ephemeral=should_use_ephemeral(interaction),
+        )
+        return
+
+    await interaction.response.send_message(
+        f"✅ Логи будут отправляться в {channel_mention}.",
+        ephemeral=should_use_ephemeral(interaction),
+    )
+    await send_guild_log_message(
+        guild.id,
+        f"⚙️ {_format_log_value(interaction.user)} назначил канал логов: {channel_mention} ({channel_id}).",
+    )
 
 # --- настройки значений по умолчанию для POS ---
 posdefaults_group = app_commands.Group(
@@ -4132,6 +4452,30 @@ async def userpos_cmd(interaction: discord.Interaction, user: discord.User):
         await interaction.followup.send(f"Ошибка: {e}", ephemeral=should_use_ephemeral(interaction))
     finally:
         conn.close()
+
+# ==================== ЛОГИРОВАНИЕ КОМАНД ====================
+@bot.event
+async def on_app_command_completion(interaction: discord.Interaction, command: app_commands.Command) -> None:
+    try:
+        name = command.qualified_name if command else (
+            interaction.command.qualified_name if interaction.command else "unknown"
+        )
+        await log_command_usage(interaction, name, success=True)
+    except Exception:
+        logger.exception("Не удалось отправить лог об успешном выполнении команды %s.", command)
+
+@tree.error
+async def on_app_command_error(
+    interaction: discord.Interaction,
+    error: app_commands.AppCommandError,
+):
+    try:
+        command = interaction.command
+        name = command.qualified_name if command else "unknown"
+        await log_command_usage(interaction, name, success=False, error=error)
+    except Exception:
+        logger.exception("Не удалось отправить лог об ошибке команды: %s", error)
+    raise error
 
 # ==================== СТАРТ ====================
 @bot.event
