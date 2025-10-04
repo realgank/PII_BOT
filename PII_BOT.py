@@ -688,6 +688,13 @@ DDL = [
     );
     """,
     """
+    CREATE TABLE IF NOT EXISTS guild_resping_channel (
+        guild_id   INTEGER PRIMARY KEY,
+        channel_id INTEGER NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+    """,
+    """
     CREATE TABLE IF NOT EXISTS user_settings (
         user_id    INTEGER PRIMARY KEY,
         language   TEXT NOT NULL,
@@ -807,6 +814,7 @@ def ensure_db_ready() -> sqlite3.Connection:
 
 # ==================== ЛОГ-КАНАЛ ====================
 _guild_log_channel_cache: Dict[int, Optional[int]] = {}
+_guild_resping_channel_cache: Dict[int, Optional[int]] = {}
 
 def get_guild_log_channel(conn: sqlite3.Connection, guild_id: int) -> Optional[int]:
     cur = conn.cursor()
@@ -850,6 +858,58 @@ def cached_log_channel_id(guild_id: int) -> Optional[int]:
     finally:
         conn.close()
     _guild_log_channel_cache[guild_id] = channel_id
+    return channel_id
+
+
+def get_guild_resping_channel(conn: sqlite3.Connection, guild_id: int) -> Optional[int]:
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT channel_id FROM guild_resping_channel WHERE guild_id=? LIMIT 1",
+        (int(guild_id),),
+    )
+    row = cur.fetchone()
+    return int(row["channel_id"]) if row else None
+
+
+def set_guild_resping_channel(
+    conn: sqlite3.Connection, guild_id: int, channel_id: int
+) -> None:
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO guild_resping_channel (guild_id, channel_id, updated_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(guild_id) DO UPDATE SET
+            channel_id=excluded.channel_id,
+            updated_at=excluded.updated_at
+        """,
+        (int(guild_id), int(channel_id), now_utc_iso()),
+    )
+    conn.commit()
+    _guild_resping_channel_cache[guild_id] = int(channel_id)
+
+
+def clear_guild_resping_channel(
+    conn: sqlite3.Connection, guild_id: int
+) -> bool:
+    cur = conn.cursor()
+    cur.execute("DELETE FROM guild_resping_channel WHERE guild_id=?", (int(guild_id),))
+    deleted = cur.rowcount > 0
+    if deleted:
+        conn.commit()
+    _guild_resping_channel_cache[guild_id] = None
+    return deleted
+
+
+def cached_resping_channel_id(guild_id: int) -> Optional[int]:
+    if guild_id in _guild_resping_channel_cache:
+        return _guild_resping_channel_cache[guild_id]
+    conn = ensure_db_ready()
+    try:
+        channel_id = get_guild_resping_channel(conn, guild_id)
+    finally:
+        conn.close()
+    _guild_resping_channel_cache[guild_id] = channel_id
     return channel_id
 
 def _truncate_log_text(text: str, limit: int = 180) -> str:
@@ -2618,17 +2678,130 @@ resping_group = app_commands.Group(
     description="Напоминания о сдаче ресурсов.",
 )
 
+
+@resping_group.command(
+    name="setchannel",
+    description="Назначить канал по умолчанию для напоминаний о сдаче ресурсов.",
+)
+@app_commands.describe(
+    channel="Канал для напоминаний (по умолчанию текущий)",
+    disable="Включи, чтобы сбросить назначенный канал",
+)
+async def resping_set_channel(
+    interaction: discord.Interaction,
+    channel: Optional[discord.abc.GuildChannel] = None,
+    disable: Optional[bool] = False,
+):
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message(
+            "Только в сервере.",
+            ephemeral=should_use_ephemeral(interaction),
+        )
+        return
+
+    if not is_admin_user(interaction):
+        await interaction.response.send_message(
+            "⛔ Команда доступна только администраторам сервера.",
+            ephemeral=should_use_ephemeral(interaction),
+        )
+        return
+
+    if disable:
+        existing_id = cached_resping_channel_id(guild.id)
+        try:
+            conn = ensure_db_ready()
+            try:
+                removed = clear_guild_resping_channel(conn, guild.id)
+            finally:
+                conn.close()
+        except Exception as exc:
+            logger.exception("resping_set_channel disable error: %s", exc)
+            await interaction.response.send_message(
+                f"Ошибка: {exc}",
+                ephemeral=should_use_ephemeral(interaction),
+            )
+            return
+
+        if removed and existing_id:
+            await send_guild_log_message(
+                guild.id,
+                f"⚙️ {_format_log_value(interaction.user)} отключил канал напоминаний.",
+                override_channel_id=existing_id,
+            )
+
+        await interaction.response.send_message(
+            "✅ Канал напоминаний сброшен." if removed else "Канал напоминаний не был настроен.",
+            ephemeral=should_use_ephemeral(interaction),
+        )
+        return
+
+    target_channel: Optional[discord.abc.Messageable] = channel
+    if target_channel is None and isinstance(interaction.channel, (discord.TextChannel, discord.Thread)):
+        target_channel = interaction.channel
+
+    if target_channel is None or not hasattr(target_channel, "send"):
+        await interaction.response.send_message(
+            "Укажи текстовый канал сервера для напоминаний.",
+            ephemeral=should_use_ephemeral(interaction),
+        )
+        return
+
+    base_guild = getattr(target_channel, "guild", None)
+    if base_guild and base_guild.id != guild.id:
+        await interaction.response.send_message(
+            "Можно выбрать только канал текущего сервера.",
+            ephemeral=should_use_ephemeral(interaction),
+        )
+        return
+
+    if not hasattr(target_channel, "id"):
+        await interaction.response.send_message(
+            "Доступны только текстовые каналы и треды.",
+            ephemeral=should_use_ephemeral(interaction),
+        )
+        return
+
+    channel_id = int(getattr(target_channel, "id"))
+    channel_mention = getattr(target_channel, "mention", f"#{getattr(target_channel, 'name', channel_id)}")
+
+    try:
+        conn = ensure_db_ready()
+        try:
+            set_guild_resping_channel(conn, guild.id, channel_id)
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.exception("resping_set_channel error: %s", exc)
+        await interaction.response.send_message(
+            f"Ошибка: {exc}",
+            ephemeral=should_use_ephemeral(interaction),
+        )
+        return
+
+    await interaction.response.send_message(
+        f"✅ Напоминания будут отправляться в {channel_mention}.",
+        ephemeral=should_use_ephemeral(interaction),
+    )
+
+    await send_guild_log_message(
+        guild.id,
+        f"⚙️ {_format_log_value(interaction.user)} назначил канал напоминаний: {channel_mention} ({channel_id}).",
+    )
+
 @resping_group.command(name="ping", description="Создать напоминание о сдаче ресурсов с кнопкой 'Сдал'.")
 @app_commands.describe(
     text="Текст напоминания",
     role="Роль для упоминания (опционально)",
     mention_everyone="Упомянуть @everyone вместе с сообщением",
+    channel="Канал для отправки напоминания (по умолчанию настроенный или текущий)",
 )
 async def resping_ping(
     interaction: discord.Interaction,
     text: str,
     role: Optional[discord.Role] = None,
     mention_everyone: bool = False,
+    channel: Optional[discord.abc.GuildChannel] = None,
 ):
     guild = interaction.guild
     if not guild:
@@ -2637,8 +2810,76 @@ async def resping_ping(
     if not is_admin_user(interaction):
         await interaction.response.send_message("⛔ Команда доступна только администраторам сервера.", ephemeral=should_use_ephemeral(interaction))
         return
-    channel = interaction.channel
-    if channel is None or not hasattr(channel, "send"):
+    requested_channel: Optional[discord.abc.Messageable] = channel
+    if requested_channel is not None:
+        base_guild = getattr(requested_channel, "guild", None)
+        if base_guild and base_guild.id != guild.id:
+            await interaction.response.send_message(
+                "Можно выбрать только канал текущего сервера.",
+                ephemeral=should_use_ephemeral(interaction),
+            )
+            return
+
+    if requested_channel is None:
+        stored_channel_id = cached_resping_channel_id(guild.id)
+        if stored_channel_id:
+            candidate = interaction.guild.get_channel(stored_channel_id)
+            if candidate is None:
+                candidate = interaction.client.get_channel(stored_channel_id) if interaction.client else None
+            if candidate is None and interaction.client is not None:
+                try:
+                    candidate = await interaction.client.fetch_channel(stored_channel_id)
+                except discord.NotFound:
+                    logger.warning(
+                        "resping_ping: сохранённый канал %s не найден для guild %s, сбрасываю настройку.",
+                        stored_channel_id,
+                        guild.id,
+                    )
+                    conn = ensure_db_ready()
+                    try:
+                        clear_guild_resping_channel(conn, guild.id)
+                    finally:
+                        conn.close()
+                    candidate = None
+                except discord.Forbidden:
+                    logger.warning(
+                        "resping_ping: нет прав на чтение сохранённого канала %s в guild %s.",
+                        stored_channel_id,
+                        guild.id,
+                    )
+                    candidate = None
+                except Exception:
+                    logger.exception(
+                        "resping_ping: не удалось получить сохранённый канал %s для guild %s.",
+                        stored_channel_id,
+                        guild.id,
+                    )
+                    candidate = None
+            if candidate is not None and hasattr(candidate, "send"):
+                requested_channel = candidate
+            else:
+                if candidate is None:
+                    await interaction.response.send_message(
+                        "Не удалось использовать сохранённый канал. Настройте его заново командой /resping setchannel.",
+                        ephemeral=should_use_ephemeral(interaction),
+                    )
+                else:
+                    await interaction.response.send_message(
+                        "Сохранённый канал больше не поддерживает отправку сообщений. Настройте его заново командой /resping setchannel.",
+                        ephemeral=should_use_ephemeral(interaction),
+                    )
+                conn = ensure_db_ready()
+                try:
+                    clear_guild_resping_channel(conn, guild.id)
+                finally:
+                    conn.close()
+                return
+
+    target_channel = requested_channel
+    if target_channel is None and hasattr(interaction, "channel"):
+        if isinstance(interaction.channel, discord.Thread) or isinstance(interaction.channel, discord.TextChannel):
+            target_channel = interaction.channel
+    if target_channel is None or not hasattr(target_channel, "send"):
         await interaction.response.send_message("Не удалось определить канал для отправки сообщения.", ephemeral=should_use_ephemeral(interaction))
         return
 
@@ -2674,20 +2915,20 @@ async def resping_ping(
         return
 
     channel_permissions: Optional[discord.Permissions] = None
-    if isinstance(bot_member, discord.Member) and hasattr(channel, "permissions_for"):
-        channel_permissions = channel.permissions_for(bot_member)
+    if isinstance(bot_member, discord.Member) and hasattr(target_channel, "permissions_for"):
+        channel_permissions = target_channel.permissions_for(bot_member)
     else:
         logger.warning(
             "resping_ping: не удалось определить права бота (guild_id=%s, channel_id=%s), пропускаю предварительную проверку.",
             getattr(guild, "id", "?"),
-            getattr(channel, "id", "?"),
+            getattr(target_channel, "id", "?"),
         )
 
     missing_permissions: List[str] = []
     if channel_permissions is not None:
         if not channel_permissions.view_channel:
             missing_permissions.append("просматривать канал")
-        if isinstance(channel, discord.Thread):
+        if isinstance(target_channel, discord.Thread):
             if not channel_permissions.send_messages_in_threads:
                 missing_permissions.append("отправлять сообщения в ветке")
         elif not channel_permissions.send_messages:
@@ -2727,7 +2968,7 @@ async def resping_ping(
             """,
             (
                 guild.id,
-                getattr(channel, "id", guild.id),
+                getattr(target_channel, "id", guild.id),
                 interaction.user.id,
                 body,
                 role.id if role else None,
@@ -2763,7 +3004,7 @@ async def resping_ping(
     allowed_mentions = discord.AllowedMentions(everyone=mention_everyone, roles=role is not None, users=False)
 
     try:
-        message = await channel.send(
+        message = await target_channel.send(
             content=mention_text,
             embed=embed,
             view=view,
@@ -2786,7 +3027,11 @@ async def resping_ping(
         cur = conn.cursor()
         cur.execute(
             "UPDATE resource_ping SET message_id=?, channel_id=? WHERE id=?",
-            (message.id, getattr(message.channel, "id", getattr(channel, "id", 0)), ping_id),
+            (
+                message.id,
+                getattr(message.channel, "id", getattr(target_channel, "id", 0)),
+                ping_id,
+            ),
         )
         conn.commit()
     except Exception as e:
