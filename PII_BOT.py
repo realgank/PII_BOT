@@ -10,7 +10,7 @@ import re
 import base64
 from collections import OrderedDict
 from datetime import datetime, timezone, timedelta
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parent
 
@@ -61,6 +61,7 @@ LOG_LEVEL_NAME = os.getenv("LOG_LEVEL", "INFO")
 
 TOKEN_ENV_NAME = os.getenv("PII_BOT_TOKEN_ENV", "DISCORD_TOKEN")
 DISCORD_TOKEN = os.getenv(TOKEN_ENV_NAME)
+BOT_SERVICE_NAME = os.getenv("BOT_SERVICE_NAME")
 
 if not DISCORD_TOKEN:
     raise RuntimeError(
@@ -226,6 +227,39 @@ async def update_bot_repository(branch: Optional[str], reinstall_deps: bool) -> 
 
     return True, "\n".join(logs)
 
+
+def prepare_service_restart() -> Tuple[Optional[str], Optional[asyncio.Task]]:
+    """Планирует перезапуск сервиса после успешного обновления."""
+
+    if not BOT_SERVICE_NAME:
+        return "Перезапуск службы не настроен: переменная BOT_SERVICE_NAME не задана.", None
+
+    systemctl = shutil.which("systemctl")
+    if not systemctl:
+        return "⚠️ Перезапуск службы пропущен: systemctl не найден в системе.", None
+
+    async def _restart() -> None:
+        try:
+            await asyncio.sleep(5)
+            logger.info("Перезапускаю службу %s по команде updatebot.", BOT_SERVICE_NAME)
+            code, out, err = await run_subprocess(
+                [systemctl, "restart", "--no-block", BOT_SERVICE_NAME]
+            )
+            if code != 0:
+                logger.error(
+                    "Не удалось перезапустить службу %s (код %s): %s %s",
+                    BOT_SERVICE_NAME,
+                    code,
+                    out.strip(),
+                    err.strip(),
+                )
+        except Exception:
+            logger.exception("Ошибка при перезапуске службы %s", BOT_SERVICE_NAME)
+
+    loop = asyncio.get_running_loop()
+    task = loop.create_task(_restart())
+    return f"🔄 Служба **{BOT_SERVICE_NAME}** будет перезапущена в ближайшие секунды.", task
+
 # --- проверка токена Discord ---
 def validate_and_clean_token(raw: Optional[str]) -> Optional[str]:
     if not raw:
@@ -289,6 +323,15 @@ DDL = [
         rate           REAL NOT NULL,
         created_at     TEXT NOT NULL,
         UNIQUE(pos_id, planet_id),
+        FOREIGN KEY (pos_id) REFERENCES pos(id) ON DELETE CASCADE
+    );
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS pos_update_ack (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        pos_id        INTEGER NOT NULL UNIQUE,
+        user_id       INTEGER NOT NULL,
+        confirmed_at  TEXT NOT NULL,
         FOREIGN KEY (pos_id) REFERENCES pos(id) ON DELETE CASCADE
     );
     """,
@@ -866,6 +909,17 @@ def build_pos_assignment_message(
         f"{assignment_text}"
     )
 
+
+def split_pos_assignment_message(full_message: str) -> Tuple[str, str]:
+    marker = "Назначения для POS"
+    idx = full_message.find(marker)
+    if idx == -1:
+        return full_message, ""
+    header = full_message[:idx].rstrip()
+    assignments = full_message[idx:].lstrip()
+    return header, assignments
+
+
 class RefreshPosModal(discord.ui.Modal):
     def __init__(self, guild_id: int, defaults: Dict[str, object]):
         super().__init__(title="Обновить POS")
@@ -945,7 +999,6 @@ class RefreshPosModal(discord.ui.Modal):
                 await interaction.followup.send("Для этого сервера у тебя нет POS.", ephemeral=ephemeral)
                 return
 
-            messages: List[str] = []
             for row in rows:
                 pos_id = int(row["id"])
                 name = row["name"]
@@ -964,27 +1017,46 @@ class RefreshPosModal(discord.ui.Modal):
                 cur.execute("UPDATE pos SET updated_at=? WHERE id=?", (now_utc_iso(), pos_id))
                 conn.commit()
 
-                messages.append(
-                    build_pos_assignment_message(
-                        name=name,
-                        system=system,
-                        constellation=constellation,
-                        assignments=assignments,
-                        slots_val=slots_val,
-                        drills_val=drills_val,
-                        defaults=defaults,
-                        slots_override=slots_override,
-                        drills_override=drills_override,
-                    )
+                full_message = build_pos_assignment_message(
+                    name=name,
+                    system=system,
+                    constellation=constellation,
+                    assignments=assignments,
+                    slots_val=slots_val,
+                    drills_val=drills_val,
+                    defaults=defaults,
+                    slots_override=slots_override,
+                    drills_override=drills_override,
                 )
 
-            full_message = "\n\n".join(messages)
-            await send_long(
-                interaction,
-                full_message,
-                ephemeral=ephemeral,
-                title="Обновление POS",
-            )
+                header_text, assignments_text = split_pos_assignment_message(full_message)
+                ack_ts = get_pos_ack_timestamp(conn, pos_id)
+                view = PosUpdateAckView(pos_id, already_confirmed=bool(ack_ts))
+
+                note = (
+                    f"ℹ️ Последняя отметка: {format_ts(ack_ts)}."
+                    if ack_ts
+                    else "🛠️ Нажми кнопку ниже, когда обновишь планеты на POS."
+                )
+                header_with_note = header_text.strip()
+                if note:
+                    header_with_note = (
+                        f"{header_with_note}\n\n{note}" if header_with_note else note
+                    )
+
+                await interaction.followup.send(
+                    header_with_note,
+                    ephemeral=ephemeral,
+                    view=view,
+                )
+
+                if assignments_text:
+                    await send_long(
+                        interaction,
+                        assignments_text,
+                        ephemeral=ephemeral,
+                        title=f"Назначения POS {name}",
+                    )
 
         except Exception as e:
             logger.exception("refresh_pos_modal error: %s", e)
@@ -1005,6 +1077,92 @@ class RefreshPosView(discord.ui.View):
         finally:
             conn.close()
         await interaction.response.send_modal(RefreshPosModal(self.guild_id, defaults))
+
+
+class PosUpdateAckButton(discord.ui.Button):
+    def __init__(self, pos_id: int, already_confirmed: bool):
+        label = "Обновить отметку" if already_confirmed else "Отметить обновление"
+        super().__init__(
+            label=label,
+            style=discord.ButtonStyle.success,
+            custom_id=f"pos_ack:{pos_id}",
+        )
+        self.pos_id = pos_id
+
+    async def callback(self, interaction: discord.Interaction):
+        conn = ensure_db_ready()
+        now_iso = now_utc_iso()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT owner_user_id, name FROM pos WHERE id=?",
+                (self.pos_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                await interaction.response.send_message(
+                    "POS не найден (возможно, удалён).",
+                    ephemeral=True,
+                )
+                return
+
+            owner_id = int(row["owner_user_id"])
+            if owner_id != interaction.user.id:
+                await interaction.response.send_message(
+                    "⛔ Отметить обновление может только владелец POS.",
+                    ephemeral=True,
+                )
+                return
+
+            cur.execute(
+                """
+                INSERT INTO pos_update_ack(pos_id, user_id, confirmed_at)
+                VALUES(?,?,?)
+                ON CONFLICT(pos_id) DO UPDATE SET
+                    user_id=excluded.user_id,
+                    confirmed_at=excluded.confirmed_at
+                """,
+                (self.pos_id, interaction.user.id, now_iso),
+            )
+            conn.commit()
+        except Exception as e:
+            logger.exception("Не удалось сохранить отметку обновления POS %s: %s", self.pos_id, e)
+            await interaction.response.send_message(
+                "Ошибка при сохранении отметки. Попробуй позже.",
+                ephemeral=True,
+            )
+            return
+        finally:
+            conn.close()
+
+        note_text = f"ℹ️ Отметка обновлена: {format_ts(now_iso)}"
+        content = interaction.message.content or ""
+        lines = content.splitlines() if content else []
+        replaced = False
+        for idx in range(len(lines) - 1, -1, -1):
+            if lines[idx].startswith("ℹ️") or lines[idx].startswith("🛠️"):
+                lines[idx] = note_text
+                replaced = True
+                break
+        if not replaced:
+            if lines:
+                lines.append(note_text)
+            else:
+                lines = [note_text]
+
+        self.disabled = True
+        self.label = "Отмечено"
+
+        await interaction.response.edit_message(
+            content="\n".join(lines),
+            view=self.view,
+        )
+
+
+class PosUpdateAckView(discord.ui.View):
+    def __init__(self, pos_id: int, already_confirmed: bool):
+        super().__init__(timeout=7 * 24 * 3600)
+        self.add_item(PosUpdateAckButton(pos_id, already_confirmed))
 
 
 def get_user_resource_assignments(
@@ -1058,6 +1216,28 @@ def get_user_resource_assignments(
             }
         )
     return result
+
+
+def get_pos_ack_timestamp(conn: sqlite3.Connection, pos_id: int) -> Optional[str]:
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT confirmed_at FROM pos_update_ack WHERE pos_id=?",
+        (pos_id,),
+    )
+    row = cur.fetchone()
+    return row["confirmed_at"] if row else None
+
+
+def clear_pos_ack(conn: sqlite3.Connection, pos_ids: Sequence[int]) -> int:
+    if not pos_ids:
+        return 0
+    placeholders = ",".join("?" * len(pos_ids))
+    cur = conn.cursor()
+    cur.execute(
+        f"DELETE FROM pos_update_ack WHERE pos_id IN ({placeholders})",
+        tuple(pos_ids),
+    )
+    return cur.rowcount or 0
 
 
 def get_guild_resource_producers(conn: sqlite3.Connection, guild_id: int) -> List[int]:
@@ -3340,6 +3520,7 @@ async def refreshpos_cmd(interaction: discord.Interaction):
             await interaction.followup.send("На сервере нет POS для обновления.", ephemeral=True)
             return
 
+        pos_ids = [int(r["id"]) for r in rows]
         owner_ids = sorted({int(r["owner_user_id"]) for r in rows if r["owner_user_id"] is not None})
 
         cur.execute(
@@ -3347,6 +3528,7 @@ async def refreshpos_cmd(interaction: discord.Interaction):
             (guild.id,),
         )
         deleted_assignments = cur.rowcount or 0
+        cleared_acks = clear_pos_ack(conn, pos_ids)
         conn.commit()
     except Exception as e:
         logger.exception("refreshpos error: %s", e)
@@ -3386,6 +3568,7 @@ async def refreshpos_cmd(interaction: discord.Interaction):
 
     summary_lines = [
         f"Сброшено назначений: **{deleted_assignments}**.",
+        f"Сброшено отметок обновления: **{cleared_acks}**.",
         f"Владельцев POS: **{len(owner_ids)}**.",
         f"Сообщений отправлено: **{notified}**.",
     ]
@@ -3548,13 +3731,34 @@ async def updatebot_cmd(
     try:
         success, log_text = await update_bot_repository(branch, reinstall_deps)
         status = "✅ Обновление завершено успешно." if success else "⚠️ Обновление завершилось с ошибкой."
-        tail = "\n\nНе забудьте перезапустить процесс/сервис бота при необходимости."
+
+        extra_lines: List[str] = []
+        restart_task: Optional[asyncio.Task] = None
+        if success:
+            info, restart_task = prepare_service_restart()
+            if info:
+                extra_lines.append(info)
+            if restart_task is None and BOT_SERVICE_NAME:
+                logger.warning(
+                    "Перезапуск службы %s не был запланирован (проверьте systemctl).",
+                    BOT_SERVICE_NAME,
+                )
+        else:
+            extra_lines.append("Перезапуск службы пропущен из-за ошибки обновления.")
+
+        body = f"{status}\n\n{log_text}"
+        if extra_lines:
+            body += "\n\n" + "\n".join(extra_lines)
+
         await send_long(
             interaction,
-            f"{status}\n\n{log_text}{tail}",
+            body,
             ephemeral=True,
             title="Обновление бота",
         )
+
+        if restart_task is None and success and not BOT_SERVICE_NAME:
+            logger.info("Перезапуск службы после updatebot не настроен (BOT_SERVICE_NAME не задана).")
     except Exception as e:
         logger.exception("updatebot error: %s", e)
         await interaction.followup.send(f"Ошибка при обновлении: {e}", ephemeral=True)
