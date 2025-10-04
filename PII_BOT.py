@@ -76,6 +76,7 @@ DEFAULT_SLOTS = int(os.getenv("DEFAULT_SLOTS", "10"))
 DEFAULT_DRILLS = int(os.getenv("DEFAULT_DRILLS", "22"))
 DEFAULT_HOURS = int(os.getenv("DEFAULT_HOURS", "168"))  # горизонт для покрытия в расчётах
 DEFAULT_BETA = float(os.getenv("DEFAULT_BETA", "0.85"))
+MANDATORY_PLANET_COUNT = int(os.getenv("MANDATORY_PLANET_COUNT", "6"))
 
 RES_REMINDER_DELAY_HOURS = int(os.getenv("RES_REMINDER_DELAY_HOURS", "24"))
 RES_REMINDER_CHECK_SECONDS = int(os.getenv("RES_REMINDER_CHECK_SECONDS", str(60 * 60)))
@@ -4119,29 +4120,156 @@ async def posstats_cmd(interaction: discord.Interaction):
     try:
         cur = conn.cursor()
         cur.execute("SELECT COUNT(*) AS c FROM pos WHERE guild_id=?", (guild.id,))
-        total = int(cur.fetchone()["c"])
-        cur.execute("""
-            SELECT owner_user_id, COUNT(*) AS c
-            FROM pos
-            WHERE guild_id=?
-            GROUP BY owner_user_id
-            ORDER BY c DESC, owner_user_id ASC
-        """, (guild.id,))
-        rows = cur.fetchall()
-        owners_total = len(rows)
-        my_count = 0
-        lines = []
-        for r in rows[:25]:
-            uid = int(r["owner_user_id"])
-            cnt = int(r["c"])
-            if uid == interaction.user.id:
-                my_count = cnt
-            member = guild.get_member(uid)
-            mention = member.mention if member else f"<@{uid}>"
-            lines.append(f"{mention}: **{cnt}**")
-        header = f"**POS на сервере:** {total}\n**Владельцев:** {owners_total}\n**У тебя:** {my_count}"
-        body = "**Топ по владельцам:**\n" + ("\n".join(lines) if lines else "_нет POS_")
-        await interaction.followup.send(header + "\n\n" + body, ephemeral=False)
+        total_pos = int(cur.fetchone()["c"])
+        if total_pos == 0:
+            await interaction.followup.send("На сервере ещё нет POS.", ephemeral=False)
+            return
+
+        cur.execute(
+            """
+            SELECT
+                p.owner_user_id        AS owner_user_id,
+                p.id                   AS pos_id,
+                p.name                 AS pos_name,
+                p.system               AS system,
+                p.constellation        AS constellation,
+                COUNT(pp.id)           AS planet_count,
+                COALESCE(SUM(pp.drills_count), 0) AS drills_total
+            FROM pos p
+            LEFT JOIN pos_planet pp ON pp.pos_id = p.id
+            WHERE p.guild_id=?
+            GROUP BY p.id
+            ORDER BY p.owner_user_id, p.id
+        """,
+            (guild.id,),
+        )
+        pos_rows = cur.fetchall()
+        if not pos_rows:
+            await interaction.followup.send("На сервере ещё нет POS.", ephemeral=False)
+            return
+
+        owner_data: Dict[int, Dict[str, object]] = {}
+        total_planets = 0
+        total_drills = 0
+        total_mandatory = 0
+
+        for row in pos_rows:
+            owner_id = int(row["owner_user_id"])
+            planet_count = int(row["planet_count"] or 0)
+            drills_total = int(row["drills_total"] or 0)
+            mandatory = min(planet_count, MANDATORY_PLANET_COUNT)
+            extra = max(0, planet_count - MANDATORY_PLANET_COUNT)
+
+            info = owner_data.setdefault(
+                owner_id,
+                {
+                    "positions": [],
+                    "planets_total": 0,
+                    "drills_total": 0,
+                    "mandatory_total": 0,
+                    "extra_total": 0,
+                },
+            )
+            info["positions"].append(
+                {
+                    "id": int(row["pos_id"]),
+                    "name": row["pos_name"],
+                    "system": row["system"],
+                    "constellation": row["constellation"],
+                    "planets": planet_count,
+                    "mandatory": mandatory,
+                    "extra": extra,
+                    "drills": drills_total,
+                }
+            )
+            info["planets_total"] += planet_count
+            info["drills_total"] += drills_total
+            info["mandatory_total"] += mandatory
+            info["extra_total"] += extra
+
+            total_planets += planet_count
+            total_drills += drills_total
+            total_mandatory += mandatory
+
+        owners_total = len(owner_data)
+
+        for info in owner_data.values():
+            positions = sorted(
+                info["positions"], key=lambda pos: pos["name"].lower() if pos["name"] else ""
+            )
+            info["positions"] = positions
+            pos_count = len(positions)
+            info["pos_count"] = pos_count
+            info["mandatory_required"] = pos_count * MANDATORY_PLANET_COUNT
+
+        def format_planet_summary(total: int, filled: int, required: int, extra: int) -> str:
+            parts: List[str] = []
+            if required > 0:
+                parts.append(f"основные: {filled}/{required}")
+            elif filled > 0:
+                parts.append(f"основные: {filled}")
+            if extra > 0:
+                parts.append(f"доп.: {extra}")
+            if not parts:
+                return str(total)
+            return f"{total} ({', '.join(parts)})"
+
+        total_extra = max(total_planets - total_mandatory, 0)
+        total_required = total_pos * MANDATORY_PLANET_COUNT
+
+        header_lines = [
+            f"**POS на сервере:** {total_pos}",
+            f"**Владельцев:** {owners_total}",
+            f"**Планет всего:** {format_planet_summary(total_planets, total_mandatory, total_required, total_extra)}",
+            f"**Буров всего:** {total_drills}",
+        ]
+
+        my_info = owner_data.get(interaction.user.id)
+        if my_info:
+            header_lines.append(
+                "**У тебя:** "
+                f"{my_info['pos_count']} POS, "
+                f"планеты {format_planet_summary(my_info['planets_total'], my_info['mandatory_total'], my_info['mandatory_required'], my_info['extra_total'])}, "
+                f"буры {my_info['drills_total']}"
+            )
+
+        owner_items = list(owner_data.items())
+        owner_items.sort(
+            key=lambda item: (
+                -int(item[1]["pos_count"]),
+                -int(item[1]["planets_total"]),
+                item[0],
+            )
+        )
+
+        lines: List[str] = []
+        for owner_id, info in owner_items:
+            member = guild.get_member(owner_id)
+            mention = member.mention if member else f"<@{owner_id}>"
+            planets_text = format_planet_summary(
+                int(info["planets_total"]),
+                int(info["mandatory_total"]),
+                int(info["mandatory_required"]),
+                int(info["extra_total"]),
+            )
+            lines.append(
+                f"{mention} — POS: {info['pos_count']}, планеты: {planets_text}, буры: {info['drills_total']}"
+            )
+            for pos in info["positions"]:
+                pos_planets = format_planet_summary(
+                    int(pos["planets"]),
+                    int(pos["mandatory"]),
+                    MANDATORY_PLANET_COUNT,
+                    int(pos["extra"]),
+                )
+                lines.append(
+                    "  • "
+                    f"{pos['name']} (ID {pos['id']}, {pos['system']}, {pos['constellation']}) — "
+                    f"планеты: {pos_planets}, буры: {pos['drills']}"
+                )
+
+        full_text = "\n".join(header_lines) + "\n\n" + "\n".join(lines)
+        await send_long(interaction, full_text, ephemeral=False, title="posstats")
     except Exception as e:
         logger.exception("posstats error: %s", e)
         await interaction.followup.send(f"Ошибка: {e}", ephemeral=should_use_ephemeral(interaction))
