@@ -2327,15 +2327,78 @@ tree = app_commands.CommandTree(bot)
 
 # --- автодополнение систем ---
 async def system_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+    q = (current or "").strip().lower()
+
+    guild = getattr(interaction, "guild", None)
+    user = getattr(interaction, "user", None)
+    guild_id = getattr(guild, "id", None)
+    user_id = getattr(user, "id", None)
+
+    pos_name: Optional[str] = None
+    namespace = getattr(interaction, "namespace", None)
+    if namespace:
+        try:
+            pos_name = namespace.get("name")  # type: ignore[attr-defined]
+        except Exception:
+            pos_name = None
+        if not pos_name:
+            pos_name = getattr(namespace, "name", None)
+        if not pos_name:
+            try:
+                for key, value in namespace:  # type: ignore[attr-defined]
+                    if key == "name":
+                        pos_name = value
+                        break
+            except Exception:
+                pos_name = None
+
     conn = ensure_db_ready()
     try:
-        items = get_distinct_systems(conn)
+        seen: Set[str] = set()
+        systems: List[str] = []
+
+        def add_system(value: Optional[str]) -> None:
+            if not value:
+                return
+            name = str(value).strip()
+            if not name:
+                return
+            key = name.lower()
+            if key in seen:
+                return
+            if q and q not in key:
+                return
+            seen.add(key)
+            systems.append(name)
+
+        if guild_id is not None and user_id is not None and pos_name:
+            cur = conn.cursor()
+            try:
+                cur.execute(
+                    """
+                    SELECT system
+                    FROM pos
+                    WHERE guild_id=? AND owner_user_id=? AND name=?
+                    ORDER BY updated_at DESC
+                    """,
+                    (int(guild_id), int(user_id), pos_name),
+                )
+                for row in cur.fetchall():
+                    add_system(row["system"] if row else None)
+                    if len(systems) >= 25:
+                        break
+            except Exception:
+                logger.exception("system_autocomplete pos lookup error")
+
+        if len(systems) < 25:
+            for value in get_distinct_systems(conn):
+                add_system(value)
+                if len(systems) >= 25:
+                    break
     finally:
         conn.close()
-    q = (current or "").lower()
-    if q:
-        items = [s for s in items if q in s.lower()]
-    return [app_commands.Choice(name=s, value=s) for s in items[:25]]
+
+    return [app_commands.Choice(name=s, value=s) for s in systems[:25]]
 
 
 async def addpos_name_autocomplete(
