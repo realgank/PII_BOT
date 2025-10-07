@@ -1328,7 +1328,15 @@ def format_discord_response(assignments: List[Assignment]) -> str:
     if not assignments:
         return "_Ничего не подобрано._"
     lines = []
-    for i, a in enumerate(assignments, 1):
+    sorted_assignments = sorted(
+        assignments,
+        key=lambda a: (
+            (a.system or "").lower(),
+            (a.planet_name or "").lower(),
+            (a.resource or "").lower(),
+        ),
+    )
+    for i, a in enumerate(sorted_assignments, 1):
         lines.append(f"{i}. {a.system} · {a.planet_name} — **{a.resource}**")
     return "\n".join(lines)
 
@@ -1722,6 +1730,13 @@ def get_user_resource_assignments(
                 "drills": drills,
                 "rate": rate,
             }
+        )
+    for info in result.values():
+        info["planets"].sort(
+            key=lambda p: (
+                (p["system"] or "").lower(),
+                (p["planet"] or "").lower(),
+            )
         )
     return result
 
