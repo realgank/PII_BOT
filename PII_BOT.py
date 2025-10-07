@@ -5113,6 +5113,133 @@ async def myassigns_cmd(interaction: discord.Interaction, pos_id: Optional[int] 
     finally:
         conn.close()
 
+
+@tree.command(name="posduplicates", description="Найти планеты, назначенные нескольким POS на сервере.")
+async def posduplicates_cmd(interaction: discord.Interaction):
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message(
+            "Только в сервере.",
+            ephemeral=should_use_ephemeral(interaction),
+        )
+        return
+
+    if not is_admin_user(interaction):
+        await interaction.response.send_message(
+            "⛔ Команда доступна только администраторам сервера.",
+            ephemeral=should_use_ephemeral(interaction),
+        )
+        return
+
+    await interaction.response.defer(ephemeral=should_use_ephemeral(interaction))
+
+    conn = ensure_db_ready()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT
+                pp.planet_id               AS planet_id,
+                COUNT(DISTINCT pp.pos_id)  AS pos_count,
+                MAX(pr.system)             AS system,
+                MAX(pr.planet_name)        AS planet_name
+            FROM pos_planet pp
+            INNER JOIN pos p ON p.id = pp.pos_id
+            LEFT JOIN planet_resources pr
+              ON (CASE WHEN typeof(pr.planet_id)='integer' AND pr.planet_id>0
+                       THEN pr.planet_id ELSE pr.rowid END) = pp.planet_id
+            WHERE p.guild_id=? AND pp.planet_id IS NOT NULL
+            GROUP BY pp.planet_id
+            HAVING COUNT(DISTINCT pp.pos_id) > 1
+            ORDER BY COUNT(DISTINCT pp.pos_id) DESC,
+                     LOWER(COALESCE(pr.system, '')),
+                     LOWER(COALESCE(pr.planet_name, ''))
+            LIMIT 200
+            """,
+            (guild.id,),
+        )
+        dup_rows = cur.fetchall()
+        if not dup_rows:
+            await interaction.followup.send(
+                "Дубликаты планет не найдены.",
+                ephemeral=should_use_ephemeral(interaction),
+            )
+            return
+
+        lines: List[str] = []
+        for row in dup_rows:
+            planet_id = int(row["planet_id"])
+            pos_count = int(row["pos_count"])
+            system = row["system"] or "?"
+            planet_name = row["planet_name"] or f"#{planet_id}"
+            lines.append(
+                f"**{system} · {planet_name}** — назначена POS-ам: {pos_count}"
+            )
+
+            cur.execute(
+                """
+                SELECT
+                    p.id              AS pos_id,
+                    p.name            AS pos_name,
+                    p.system          AS pos_system,
+                    p.owner_user_id   AS owner_user_id,
+                    pp.resource       AS resource,
+                    pp.drills_count   AS drills,
+                    pp.rate           AS rate
+                FROM pos_planet pp
+                INNER JOIN pos p ON p.id = pp.pos_id
+                WHERE p.guild_id=? AND pp.planet_id=?
+                ORDER BY p.id
+                """,
+                (guild.id, planet_id),
+            )
+            assignments = cur.fetchall()
+            for assignment in assignments:
+                owner_id = assignment["owner_user_id"]
+                member = guild.get_member(owner_id) if owner_id else None
+                if member is not None:
+                    owner = member.mention
+                elif owner_id:
+                    owner = f"<@{owner_id}>"
+                else:
+                    owner = "—"
+
+                drills = int(assignment["drills"] or 0)
+                rate_value = assignment["rate"]
+                rate_text = (
+                    f", {float(rate_value):.1f}/ч"
+                    if rate_value is not None
+                    else ""
+                )
+                lines.append(
+                    " · ".join(
+                        [
+                            f"POS **{assignment['pos_name']}** (ID {int(assignment['pos_id'])}, {assignment['pos_system']})",
+                            f"ресурс: {assignment['resource']}",
+                            f"буров: {drills}{rate_text}",
+                            f"владелец: {owner}",
+                        ]
+                    )
+                )
+
+            lines.append("")
+
+        await send_long(
+            interaction,
+            "\n".join(lines).strip(),
+            ephemeral=should_use_ephemeral(interaction),
+            title="Дубликаты планет",
+        )
+    except Exception as e:
+        logger.exception("posduplicates error: %s", e)
+        await interaction.followup.send(
+            f"Ошибка: {e}",
+            ephemeral=should_use_ephemeral(interaction),
+        )
+    finally:
+        conn.close()
+
+
 # --- НОВОЕ: POS конкретного пользователя ---
 @tree.command(name="userpos", description="Список POS указанного пользователя на сервере.")
 @app_commands.describe(user="Пользователь (упоминание или выбор из списка)")
