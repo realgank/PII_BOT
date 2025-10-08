@@ -1244,6 +1244,10 @@ def build_candidates(conn: sqlite3.Connection, constellation: str) -> Dict[str, 
     return out
 
 # ==================== ПЛАНИРОВЩИК ====================
+class AssignmentValidationError(Exception):
+    """Ошибка проверки назначений планет."""
+
+
 class Assignment:
     __slots__ = ("planet_id","resource","drills","rate","system","planet_name","base_out","isk_per_hour")
     def __init__(self, planet_id:int, resource:str, drills:int, rate:float,
@@ -1251,6 +1255,82 @@ class Assignment:
         self.planet_id=planet_id; self.resource=resource; self.drills=drills
         self.rate=rate; self.system=system; self.planet_name=planet_name
         self.base_out=base_out; self.isk_per_hour=isk_per_hour
+
+
+_ROMAN_PATTERN = re.compile(
+    r"^M{0,4}(CM|CD|D?C{0,3})(XC|XL|L?X{0,3})(IX|IV|V?I{0,3})$",
+    re.IGNORECASE,
+)
+_PLANET_NUMBER_PATTERN = re.compile(
+    r"^(?P<name>.+?)(?:\s*[-–]\s*|\s+)(?P<roman>[IVXLCDM]+)$",
+    re.IGNORECASE,
+)
+
+
+def _normalize_whitespace(value: Optional[str]) -> str:
+    return re.sub(r"\s+", " ", (value or "").strip())
+
+
+def _extract_planet_designation(system: Optional[str], planet_name: Optional[str]) -> Tuple[str, str, str]:
+    system_norm = _normalize_whitespace(system)
+    if not system_norm:
+        raise AssignmentValidationError("Не указана система для планеты.")
+
+    name_norm = _normalize_whitespace(planet_name)
+    if not name_norm:
+        raise AssignmentValidationError(f"{system_norm}: пустое название планеты.")
+
+    match = _PLANET_NUMBER_PATTERN.match(name_norm)
+    if match:
+        base_name = _normalize_whitespace(match.group("name"))
+        roman = match.group("roman").upper()
+    else:
+        if re.fullmatch(r"[IVXLCDM]+", name_norm, re.IGNORECASE):
+            base_name = system_norm
+            roman = name_norm.upper()
+        else:
+            raise AssignmentValidationError(
+                f"{system_norm}: не удалось определить номер планеты в названии '{name_norm}'."
+            )
+
+    if not base_name:
+        raise AssignmentValidationError(
+            f"{system_norm}: не удалось определить название планеты в '{name_norm}'."
+        )
+
+    if not _ROMAN_PATTERN.fullmatch(roman):
+        raise AssignmentValidationError(
+            f"{system_norm}: номер планеты '{roman}' имеет неверный формат."
+        )
+
+    return system_norm.lower(), base_name.lower(), roman
+
+
+def validate_assignment_planets(assignments: Sequence[Assignment]) -> None:
+    seen: Dict[Tuple[str, str, str], Assignment] = {}
+    errors: List[str] = []
+    for assignment in assignments:
+        try:
+            sys_key, name_key, roman = _extract_planet_designation(
+                assignment.system,
+                assignment.planet_name,
+            )
+        except AssignmentValidationError as exc:
+            errors.append(str(exc))
+            continue
+
+        key = (sys_key, name_key, roman)
+        if key in seen:
+            prev = seen[key]
+            errors.append(
+                f"{_normalize_whitespace(assignment.system)} · {assignment.planet_name} — дубликат "
+                f"(также назначена как {_normalize_whitespace(prev.system)} · {prev.planet_name})"
+            )
+        else:
+            seen[key] = assignment
+
+    if errors:
+        raise AssignmentValidationError("; ".join(dict.fromkeys(errors)))
 
 def plan_assignments(
     conn: sqlite3.Connection,
@@ -1381,6 +1461,7 @@ def build_pos_assignment_message(
     slots_override: bool,
     drills_override: bool,
 ) -> str:
+    validate_assignment_planets(assignments)
     def format_source(overridden: bool) -> str:
         if overridden:
             return "указано вручную"
