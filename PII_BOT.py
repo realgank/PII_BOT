@@ -1344,33 +1344,64 @@ def plan_assignments(
     prices: Optional[Dict[str, float]] = None
 ) -> List[Assignment]:
     candidates = build_candidates(conn, constellation)
-    need_left = {r: float(v) for r,v in rest_units.items() if v>0}
-    next_idx: Dict[str,int] = {r:0 for r in candidates}
-    used_planets: set[int] = set()
-    per_res_taken: Dict[str,int] = {}
+    need_left = {r: float(v) for r, v in rest_units.items() if v > 0}
+    next_idx: Dict[str, int] = {r: 0 for r in candidates}
+    used_planets: Set[int] = set()
+    skipped_planets: Set[int] = set()
+    used_designations: Set[Tuple[str, str, str]] = set()
+    per_res_taken: Dict[str, int] = {}
     global_rph = active_production_rates(conn, guild_id)
 
-    def advance(res:str)->Optional[dict]:
+    def advance(res: str) -> Tuple[Optional[dict], Optional[Tuple[str, str, str]]]:
         lst = candidates.get(res) or []
-        i = next_idx.get(res,0)
-        while i < len(lst) and int(lst[i]["planet_id"]) in used_planets:
-            i += 1
-        next_idx[res]=i
-        return lst[i] if i < len(lst) else None
+        i = next_idx.get(res, 0)
+        while i < len(lst):
+            cand = lst[i]
+            pid = int(cand["planet_id"])
+            if pid in used_planets or pid in skipped_planets:
+                i += 1
+                continue
+            try:
+                designation = _extract_planet_designation(cand["system"], cand["planet"])
+            except AssignmentValidationError as exc:  # pragma: no cover - защитный код
+                logger.warning(
+                    "Пропускаю планету %s · %s: %s",
+                    _normalize_whitespace(cand.get("system")),
+                    _normalize_whitespace(cand.get("planet")),
+                    exc,
+                )
+                skipped_planets.add(pid)
+                i += 1
+                continue
+            if designation in used_designations:
+                logger.info(
+                    "Найдена дублирующаяся планета %s · %s, ищу замену",
+                    _normalize_whitespace(cand.get("system")),
+                    _normalize_whitespace(cand.get("planet")),
+                )
+                skipped_planets.add(pid)
+                i += 1
+                continue
+            next_idx[res] = i
+            return cand, designation
+        next_idx[res] = i
+        return None, None
 
-    def rows_by_worst_eta(include_slot: bool) -> List[Tuple[str,float,dict,float]]:
-        rows=[]
+    def rows_by_worst_eta(include_slot: bool) -> List[Tuple[str, float, dict, float, Tuple[str, str, str]]]:
+        rows: List[Tuple[str, float, dict, float, Tuple[str, str, str]]] = []
         for res, left_units in need_left.items():
-            if left_units <= 0: continue
-            cand = advance(res)
-            if not cand: continue
+            if left_units <= 0:
+                continue
+            cand, designation = advance(res)
+            if not cand or not designation:
+                continue
             base_out = max(float(cand["output"]), 1e-9)
-            mult = (beta ** per_res_taken.get(res,0)) if beta<1.0 else 1.0
+            mult = (beta ** per_res_taken.get(res, 0)) if beta < 1.0 else 1.0
             slot_rph = base_out * drills * mult
             base_global = float(global_rph.get(res, 0.0))
             denom = base_global + (slot_rph if include_slot else 0.0)
-            eta_h = (left_units / denom) if denom>0 else float("inf")
-            rows.append((res, eta_h, cand, slot_rph))
+            eta_h = (left_units / denom) if denom > 0 else float("inf")
+            rows.append((res, eta_h, cand, slot_rph, designation))
         rows.sort(key=lambda t: t[1], reverse=True)
         return rows
 
@@ -1378,16 +1409,29 @@ def plan_assignments(
 
     while len(assignments) < slots:
         rows = rows_by_worst_eta(include_slot=True)
-        if not rows: break
-        res, _eta, cand, slot_rph = rows[0]
-        pid = int(cand["planet_id"]); base_out=float(cand["output"])
-        mult = (beta ** per_res_taken.get(res,0)) if beta<1.0 else 1.0
+        if not rows:
+            break
+        res, _eta, cand, slot_rph, designation = rows[0]
+        pid = int(cand["planet_id"])
+        base_out = float(cand["output"])
+        mult = (beta ** per_res_taken.get(res, 0)) if beta < 1.0 else 1.0
         produced_units = slot_rph * horizon_hours
         need_left[res] = max(0.0, need_left[res] - produced_units)
-        a = Assignment(pid, res, drills, base_out*mult, cand["system"], cand["planet"], base_out,
-                       (base_out*mult*drills*(prices.get(res,0.0) if prices else 0.0)))
-        assignments.append(a); used_planets.add(pid); per_res_taken[res]=per_res_taken.get(res,0)+1
-        global_rph[res] = global_rph.get(res,0.0) + slot_rph
+        a = Assignment(
+            pid,
+            res,
+            drills,
+            base_out * mult,
+            cand["system"],
+            cand["planet"],
+            base_out,
+            (base_out * mult * drills * (prices.get(res, 0.0) if prices else 0.0)),
+        )
+        assignments.append(a)
+        used_planets.add(pid)
+        used_designations.add(designation)
+        per_res_taken[res] = per_res_taken.get(res, 0) + 1
+        global_rph[res] = global_rph.get(res, 0.0) + slot_rph
 
     return assignments
 
