@@ -1051,6 +1051,20 @@ def get_distinct_systems(conn: sqlite3.Connection) -> List[str]:
     cur.execute("""SELECT system FROM planet_resources GROUP BY system ORDER BY system""")
     return [r["system"] for r in cur.fetchall()]
 
+
+def get_distinct_constellations(conn: sqlite3.Connection) -> List[str]:
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT constellation
+        FROM planet_resources
+        WHERE constellation IS NOT NULL AND TRIM(constellation) <> ''
+        GROUP BY constellation
+        ORDER BY constellation
+        """
+    )
+    return [r["constellation"] for r in cur.fetchall()]
+
 def load_guild_have(conn: sqlite3.Connection, guild_id: int) -> Dict[str, float]:
     cur = conn.cursor()
     cur.execute("""SELECT resource, amount_units FROM guild_have WHERE guild_id=?""", (guild_id,))
@@ -2539,6 +2553,37 @@ async def system_autocomplete(interaction: discord.Interaction, current: str) ->
         conn.close()
 
     return [app_commands.Choice(name=s, value=s) for s in systems[:25]]
+
+
+async def constellation_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> List[app_commands.Choice[str]]:
+    conn = ensure_db_ready()
+    try:
+        constellations = get_distinct_constellations(conn)
+    finally:
+        conn.close()
+
+    q = (current or "").strip().lower()
+    seen: Set[str] = set()
+    items: List[str] = []
+    for name in constellations:
+        if not name:
+            continue
+        key = str(name).strip()
+        if not key:
+            continue
+        low = key.lower()
+        if q and q not in low:
+            continue
+        if low in seen:
+            continue
+        seen.add(low)
+        items.append(key)
+        if len(items) >= 25:
+            break
+
+    return [app_commands.Choice(name=value, value=value) for value in items]
 
 
 async def addpos_name_autocomplete(
@@ -4257,6 +4302,153 @@ async def eta_cmd(
         await interaction.followup.send(f"Ошибка: {e}", ephemeral=should_use_ephemeral(interaction))
     finally:
         conn.close()
+
+@tree.command(name="consttop", description="Топ планет по ISK/ч в указанном созвездии.")
+@app_commands.describe(
+    constellation="Созвездие, для которого нужен топ",
+    limit="Сколько планет показать (1-25)",
+    drills="Количество буров на планету",
+)
+@app_commands.autocomplete(constellation=constellation_autocomplete)
+async def consttop_cmd(
+    interaction: discord.Interaction,
+    constellation: str,
+    limit: Optional[int] = None,
+    drills: Optional[int] = None,
+):
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message(
+            "Только в сервере.",
+            ephemeral=should_use_ephemeral(interaction),
+        )
+        return
+
+    constellation_name = (constellation or "").strip()
+    if not constellation_name:
+        await interaction.response.send_message(
+            "Укажи созвездие.",
+            ephemeral=should_use_ephemeral(interaction),
+        )
+        return
+
+    limit_val = max(1, min(int(limit or 10), 25))
+    drills_val = int(drills or DEFAULT_DRILLS)
+    if drills_val <= 0:
+        await interaction.response.send_message(
+            "Количество буров должно быть положительным.",
+            ephemeral=should_use_ephemeral(interaction),
+        )
+        return
+
+    await interaction.response.defer(ephemeral=should_use_ephemeral(interaction))
+    conn = ensure_db_ready()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT
+                CASE WHEN typeof(planet_id)='integer' AND planet_id>0 THEN planet_id ELSE rowid END AS planet_id,
+                system,
+                planet_name,
+                resource,
+                output
+            FROM planet_resources
+            WHERE constellation=? AND output>0
+            """,
+            (constellation_name,),
+        )
+        rows = cur.fetchall()
+        if not rows:
+            await interaction.followup.send(
+                "В базе нет данных по этому созвездию.",
+                ephemeral=should_use_ephemeral(interaction),
+            )
+            return
+
+        prices_general = get_prices(conn)
+        prices_have = load_have_prices(conn, int(guild.id))
+        prices = dict(prices_general)
+        prices.update(prices_have)
+
+        results: List[Tuple[float, float, str, str, str, float]] = []
+        missing_prices: Set[str] = set()
+
+        for row in rows:
+            resource = clean_resource_name(row["resource"])
+            if not resource:
+                continue
+            price = prices.get(resource)
+            if price is None:
+                missing_prices.add(resource)
+                continue
+            base_out = float(row["output"] or 0.0)
+            if base_out <= 0:
+                continue
+            hourly_units = base_out * drills_val
+            isk_per_hour = hourly_units * float(price)
+            results.append(
+                (
+                    isk_per_hour,
+                    hourly_units,
+                    resource,
+                    str(row["system"] or ""),
+                    str(row["planet_name"] or ""),
+                    float(price),
+                )
+            )
+
+        if not results:
+            text = "Нет планет с заданными ценами для этого созвездия. Обнови цены через `/isk`."
+            await interaction.followup.send(
+                text,
+                ephemeral=should_use_ephemeral(interaction),
+            )
+            return
+
+        results.sort(key=lambda item: item[0], reverse=True)
+        top_rows = results[:limit_val]
+
+        lines = []
+        for idx, (isk_per_hour, hourly_units, resource, system, planet_name, price) in enumerate(top_rows, 1):
+            isk_txt = f"{isk_per_hour:,.0f}".replace(",", " ")
+            units_txt = f"{hourly_units:,.0f}".replace(",", " ")
+            price_txt = f"{price:,.2f}".replace(",", " ")
+            system_txt = system or "?"
+            planet_txt = planet_name or "?"
+            lines.append(
+                f"{idx}. {system_txt} · {planet_txt} — **{resource}** — {units_txt} ед/ч — ≈ {isk_txt} ISK/ч (цена {price_txt} ISK/ед)"
+            )
+
+        header = (
+            f"**Топ планет по ISK/ч для созвездия {constellation_name}**\n"
+            f"Количество буров: **{drills_val}**"
+        )
+
+        if missing_prices:
+            missing_list = sorted(missing_prices)
+            if len(missing_list) > 5:
+                missing_tail = ", ".join(missing_list[:5]) + " и другие"
+            else:
+                missing_tail = ", ".join(missing_list)
+            lines.append("")
+            lines.append(f"_Нет цен для ресурсов: {missing_tail}._")
+
+        await send_long(
+            interaction,
+            header + "\n" + "\n".join(lines),
+            ephemeral=should_use_ephemeral(interaction),
+            title="ISK Top",
+        )
+    except Exception as exc:
+        logger.exception("consttop error: %s", exc)
+        await interaction.followup.send(
+            f"Ошибка: {exc}",
+            ephemeral=should_use_ephemeral(interaction),
+        )
+    finally:
+        conn.close()
+
 
 @tree.command(name="isk", description="Цены ресурсов (ISK/ед).")
 @app_commands.describe(action="set/show/import", resource="Ресурс (для set/show)", price="Цена (для set)", csv_prices="CSV строки: resource,price")
