@@ -4910,7 +4910,13 @@ async def delpos_cmd(interaction: discord.Interaction, pos_id: Optional[int] = N
     try:
         cur = conn.cursor()
         if pos_id is None:
-            cur.execute("SELECT id, name, system, constellation, created_at FROM pos WHERE guild_id=? ORDER BY id DESC", (guild.id,))
+            params = [guild.id]
+            query = "SELECT id, name, system, constellation, created_at FROM pos WHERE guild_id=?"
+            if not is_admin_user(interaction):
+                query += " AND owner_user_id=?"
+                params.append(interaction.user.id)
+            query += " ORDER BY id DESC"
+            cur.execute(query, params)
             rows = cur.fetchall()
             if not rows:
                 await interaction.followup.send("POS-ов нет.", ephemeral=should_use_ephemeral(interaction)); return
@@ -4983,6 +4989,90 @@ async def delallpos_cmd(interaction: discord.Interaction):
             )
     except Exception as e:
         logger.exception("delallpos error: %s", e)
+        await interaction.followup.send(f"Ошибка: {e}", ephemeral=should_use_ephemeral(interaction))
+    finally:
+        conn.close()
+
+@tree.command(name="adminpos", description="Показать все POS на сервере или удалить выбранный (только для админов).")
+@app_commands.describe(pos_id="ID POS для удаления")
+async def adminpos_cmd(interaction: discord.Interaction, pos_id: Optional[int] = None):
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("Только в сервере.", ephemeral=should_use_ephemeral(interaction)); return
+    if not is_admin_user(interaction):
+        await interaction.response.send_message(
+            "⛔ Команда доступна только администраторам сервера.",
+            ephemeral=should_use_ephemeral(interaction),
+        )
+        return
+
+    await interaction.response.defer(ephemeral=should_use_ephemeral(interaction))
+    conn = ensure_db_ready()
+    try:
+        cur = conn.cursor()
+        if pos_id is None:
+            cur.execute(
+                """
+                SELECT id, name, system, constellation, created_at, updated_at, owner_user_id
+                FROM pos
+                WHERE guild_id=?
+                ORDER BY id DESC
+                """,
+                (guild.id,),
+            )
+            rows = cur.fetchall()
+            if not rows:
+                await interaction.followup.send("POS-ов нет.", ephemeral=should_use_ephemeral(interaction)); return
+
+            lines = [
+                " · ".join(
+                    [
+                        f"ID **{r['id']}** — {r['name']} ({r['system']}, {r['constellation']})",
+                        f"создан {r['created_at']} · обновлён {r['updated_at']}",
+                        f"владелец <@{int(r['owner_user_id'])}>" if r["owner_user_id"] else "владелец не указан",
+                    ]
+                )
+                for r in rows
+            ]
+            await send_long(
+                interaction,
+                "\n".join(lines),
+                ephemeral=should_use_ephemeral(interaction),
+                title="Все POS на сервере",
+            )
+            return
+
+        cur.execute(
+            "SELECT id, name, system, constellation, owner_user_id FROM pos WHERE id=? AND guild_id=?",
+            (pos_id, guild.id),
+        )
+        row = cur.fetchone()
+        if not row:
+            await interaction.followup.send("POS не найден.", ephemeral=should_use_ephemeral(interaction)); return
+
+        owner_id = int(row["owner_user_id"]) if row["owner_user_id"] is not None else None
+        owner_info = f"<@{owner_id}>" if owner_id else "не указан"
+
+        cur.execute("DELETE FROM pos_planet WHERE pos_id=?", (pos_id,))
+        cur.execute("DELETE FROM pos WHERE id=?", (pos_id,))
+        conn.commit()
+        await interaction.followup.send(
+            f"🗑️ Админ удалил POS **{pos_id}** (владелец {owner_info}).",
+            ephemeral=should_use_ephemeral(interaction),
+        )
+
+        await send_guild_log_message(
+            interaction.guild_id,
+            " ".join(
+                [
+                    f"🗑️ {_format_log_value(interaction.user)} удалил POS **{row['name']}**",
+                    f"(# {pos_id}) в системе {row['system']} ({row['constellation']}).",
+                    f"Владелец: {owner_info}",
+                ]
+            ),
+        )
+    except Exception as e:
+        logger.exception("adminpos error: %s", e)
         await interaction.followup.send(f"Ошибка: {e}", ephemeral=should_use_ephemeral(interaction))
     finally:
         conn.close()
