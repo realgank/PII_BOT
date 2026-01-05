@@ -4807,6 +4807,39 @@ async def addpos_cmd(
     finally:
         conn.close()
 
+
+@tree.command(name="info", description="Detailed English guide about /addpos.")
+async def addpos_info_command(interaction: discord.Interaction):
+    ephemeral = should_use_ephemeral(interaction)
+    info_lines = [
+        "**What `/addpos` does**",
+        "Registers or refreshes your POS in the current server and auto-assigns planets/drills to cover guild resource goals.",
+        "",
+        "**Parameters**",
+        "- `name` (required): POS name exactly as in the game. If a POS with this name already exists, it will be updated instead of creating a duplicate.",
+        "- `system` (required): Solar system (with autocomplete). Must exist in the internal database; the constellation of this system defines where planets are searched.",
+        "- `slots` (optional): How many planet slots to fill. Defaults come from `/posdefaults setuser`, then `/posdefaults setguild`, then environment defaults. Valid range: 6–14.",
+        "- `drills` (optional): How many drills to place on each planet. Uses the same default logic as `slots`. Valid range: 1–50.",
+        "- Planet count is capped at `slots`, but may be lower if there are fewer valid planets in the constellation. Each planet is unique; duplicates are discarded.",
+        "- Drill count applies per planet: `drills` × planets = total drills assigned. If you request 10 planets with 22 drills each, the bot aims for 220 drills in total.",
+        "",
+        "**Ownership and permissions**",
+        "- Can be used only inside a server (not in DMs).",
+        "- When the POS name is already taken, only the current owner or a server administrator can overwrite it; others get a denial message.",
+        "- New POS entries are stored with the caller as the owner; updates keep the existing owner unless replaced by an admin.",
+        "",
+        "**How planets are chosen**",
+        "- The bot looks at server needs (`/need`) minus the warehouse (`/have`) and existing POS production to decide which resources are still missing.",
+        "- Only planets within the chosen constellation are considered; duplicates and invalid planet designations are skipped.",
+        "- Up to `slots` planets are picked, each with `drills` applied. If fewer than `slots` planets remain after filtering, the bot assigns all available ones.",
+        "- Repeated assignments of the same resource use diminishing returns so coverage is spread across needs. This keeps total drill count closer to the requested target.",
+        "",
+        "**Result and logging**",
+        "- The reply lists the POS name, system, constellation, and the assigned planets/resources. Overrides of `slots`/`drills` are explicitly highlighted.",
+        "- Actions are recorded in the guild log channel if one is configured via `/setlogchannel`.",
+    ]
+    await interaction.response.send_message("\n".join(info_lines), ephemeral=ephemeral)
+
 @tree.command(name="refreshpos", description="Сбросить все POS и запросить обновление у владельцев.")
 async def refreshpos_cmd(interaction: discord.Interaction):
     guild = interaction.guild
