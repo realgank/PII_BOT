@@ -4837,6 +4837,13 @@ async def addpos_info_command(interaction: discord.Interaction):
         "**Result and logging**",
         "- The reply lists the POS name, system, constellation, and the assigned planets/resources. Overrides of `slots`/`drills` are explicitly highlighted.",
         "- Actions are recorded in the guild log channel if one is configured via `/setlogchannel`.",
+        "",
+        "**Step-by-step walkthrough**",
+        "1) Set defaults once via `/posdefaults setguild` (or `/posdefaults setuser` for personal overrides). If `slots`/`drills` are omitted later, these defaults are used.",
+        "2) Call `/addpos` in the target server with at least `name` and `system`. Leave `slots` and `drills` empty to inherit the defaults from step 1.",
+        "3) Wait for the response: the bot will create or update the POS and immediately assign planets and drills based on current needs and availability.",
+        "4) If the POS belongs to someone else, only the owner or a server admin can overwrite it; others will see a denial message.",
+        "5) Re-run `/info` anytime to recall these rules and defaults before adding or refreshing your POS.",
     ]
     text = "\n".join(info_lines)
     chunks = []
