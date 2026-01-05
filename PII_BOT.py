@@ -4838,7 +4838,21 @@ async def addpos_info_command(interaction: discord.Interaction):
         "- The reply lists the POS name, system, constellation, and the assigned planets/resources. Overrides of `slots`/`drills` are explicitly highlighted.",
         "- Actions are recorded in the guild log channel if one is configured via `/setlogchannel`.",
     ]
-    await interaction.response.send_message("\n".join(info_lines), ephemeral=ephemeral)
+    text = "\n".join(info_lines)
+    chunks = []
+    current = ""
+    for line in text.split("\n"):
+        if current and len(current) + 1 + len(line) > 2000:
+            chunks.append(current)
+            current = line
+        else:
+            current = line if not current else f"{current}\n{line}"
+    if current:
+        chunks.append(current)
+
+    await interaction.response.send_message(chunks[0], ephemeral=ephemeral)
+    for chunk in chunks[1:]:
+        await interaction.followup.send(chunk, ephemeral=ephemeral)
 
 @tree.command(name="refreshpos", description="Сбросить все POS и запросить обновление у владельцев.")
 async def refreshpos_cmd(interaction: discord.Interaction):
