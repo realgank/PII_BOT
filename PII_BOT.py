@@ -5153,7 +5153,18 @@ async def mypos_cmd(interaction: discord.Interaction):
             f"ID **{r['id']}** — {r['name']} ({r['system']}, {r['constellation']}) · создан {r['created_at']} · обновлён {r['updated_at']}"
             for r in rows[:25]
         ]
-        await interaction.followup.send("\n".join(lines), ephemeral=should_use_ephemeral(interaction))
+        chunks = []
+        current = ""
+        for line in lines:
+            if current and len(current) + 1 + len(line) > MAX_DISCORD_MSG:
+                chunks.append(current)
+                current = line
+            else:
+                current = line if not current else f"{current}\n{line}"
+        if current:
+            chunks.append(current)
+        for chunk in chunks:
+            await interaction.followup.send(chunk, ephemeral=should_use_ephemeral(interaction))
     except Exception as e:
         logger.exception("mypos error: %s", e)
         await interaction.followup.send(f"Ошибка: {e}", ephemeral=should_use_ephemeral(interaction))
@@ -5838,4 +5849,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
