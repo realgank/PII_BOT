@@ -999,12 +999,13 @@ async def send_guild_log_message(
             return
 
     timestamp = format_dt(datetime.now(timezone.utc))
-    message = f"[{timestamp}] {content}"
-    if len(message) > 1900:
-        message = message[:1897] + "…"
+    prefix = f"[{timestamp}] "
+    max_content_len = max(1, 2000 - len(prefix))
+    chunks = [content[i : i + max_content_len] for i in range(0, len(content), max_content_len)] or [""]
 
     try:
-        await channel.send(message)
+        for chunk in chunks:
+            await channel.send(f"{prefix}{chunk}")
     except discord.Forbidden:
         logger.warning("Нет прав отправлять сообщения в канал логов %s для guild %s.", channel_id, guild_id_int)
     except discord.HTTPException as e:
@@ -2789,6 +2790,39 @@ async def set_log_channel_command(
     await send_guild_log_message(
         guild.id,
         f"⚙️ {_format_log_value(interaction.user)} назначил канал логов: {channel_mention} ({channel_id}).",
+    )
+
+
+@tree.command(name="contactadmin", description="Отправить сообщение администраторам (в лог-канал).")
+@app_commands.describe(message="Текст сообщения для передачи в лог-канал")
+async def contact_admin_command(
+    interaction: discord.Interaction,
+    message: str,
+):
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message(
+            "Только в сервере.",
+            ephemeral=should_use_ephemeral(interaction),
+        )
+        return
+
+    if not cached_log_channel_id(guild.id):
+        await interaction.response.send_message(
+            "Канал логов не настроен. Администратор может назначить его через /setlogchannel.",
+            ephemeral=should_use_ephemeral(interaction),
+        )
+        return
+
+    user_repr = _format_log_value(interaction.user)
+    channel_repr = _format_log_value(interaction.channel)
+    await send_guild_log_message(
+        guild.id,
+        f"📩 Сообщение для админов от {user_repr} в {channel_repr}: {message}",
+    )
+    await interaction.response.send_message(
+        "✅ Сообщение передано администраторам.",
+        ephemeral=should_use_ephemeral(interaction),
     )
 
 
